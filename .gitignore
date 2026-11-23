@@ -1,0 +1,6 @@
+node_modules/
+# Real WMS / transport exports stay out of this public repo
+*.xls
+*.xlsx
+*.xlsm
+*.csv

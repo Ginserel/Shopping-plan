@@ -1,0 +1,12 @@
+{
+  "name": "shopping-plan",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Picking shopping plan: fills trailers by pulling later orders forward, from the WMS picking status and the transport plan.",
+  "scripts": {
+    "build": "node tools/build.js",
+    "test": "node --test test/*.test.js",
+    "plan": "node tools/plan-cli.js"
+  },
+  "license": "UNLICENSED"
+}
