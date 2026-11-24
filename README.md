@@ -1,23 +1,36 @@
 # Shopping Plan
 
-A shopping list for the picking admin. It reads the **WMS Picking Status** export and the **transport plan**, links every order to its trailer, and finds trailers that would leave half empty. For each one it lists the later orders for the same customer that should be picked early ("shopped") to fill it. It also flags trailers that end up with no orders, so transport can decide whether they still need to run.
+The FLM's daily pick plan, built from the **WMS Picking Status** export and the **transport plan**. It lists every trailer for the day with its pick-by, loading and delivery times, suggests which orders go on each one, and lets the FLM choose. The finished list goes to the admin as an Excel file in the same layout as the hand-made "Pick Plan" sheet. The admin uses it to release orders to the pickers.
 
-Example: the Compact 07:30 trailer has 4 picks on it. The 18:00 Compact orders are pulled forward to fill it, and the 18:00 trailer is flagged as "maybe not needed".
+Kitting and decant are left out. Both can be switched back on under Rules.
 
 ## Use it
 
 1. Open `dist/shopping-plan.html` in a browser. It is one file and works offline, so it can live on a shared drive.
 2. Click **Load files**, or drop both exports on the page: the Picking Status `.xls` and the transport plan `.xlsx`. The app works out which file is which.
-3. Work down the **Shopping list** tab. It is sorted by when each trailer's paperwork is due. Tick orders as you send them to picking. **Copy for Excel / Teams** copies the list.
+3. Pick the **delivery day**. It starts on the next day that has orders.
+4. On the **Plan** tab, each trailer is a row in pick-by order. Its suggested orders sit under it as dashed buttons:
+   - click a suggestion to put it on the trailer, or **Add all** for that trailer, or **Add all suggestions** for the whole day;
+   - **+ Add an order…** puts any other order on the trailer (same customer first, nearest due time first);
+   - **×** takes an order off. Orders can also be dragged between trailers, or back to the side panel;
+   - **Not on the list yet** (the side panel) holds every order still to place, each with a one-click button for its suggested trailer;
+   - **Undo** reverses the last change;
+   - each trailer has a comment box for the admin.
+5. On the **Shopping list** tab, check the result and use **Download Excel**, **Copy table** or **Print**.
 
-Other tabs:
+Nothing goes on the list until the FLM adds it. Choices and comments are saved in the browser, so loading a newer picking export later in the day keeps the list. The status updates from the new export (To release → Released → Pick in progress → Picked).
 
 | Tab | What it's for |
 | --- | --- |
-| Trailers | Every trailer per customer with a fill bar. Solid = own orders, striped = shopped in, line = target. |
-| Exceptions | Over capacity, no trailer at the due time, missed trailers, Landpower decisions, collections. |
-| Orders | Every order. Set a trailer share by hand (Landpower engines, rubber-track machines) or tick **Keep** to stop it moving. |
-| Rules | Picks per trailer by area, order rules, customer names, fill target. Saved in the browser. |
+| Plan | Trailers for the day with chosen orders, suggestions and fill bars. Side panel of orders not on the list yet. |
+| Shopping list | The admin's pick plan: Deliver To, Delivery Type, Picked By, Loaded By, Delivery Time, Orders to pick, Status, Comments, plus waves to release, picks left and trailer fill. |
+| Checks | Trailers on the list that are over capacity, have late orders or have passed pick-by. Also orders with no trailer, X-Dock sharing ideas, collections and unknown customers. |
+| Orders | Every order, with a button to put it on its suggested trailer. Set a trailer share by hand when the estimate is wrong. |
+| Rules | Pick-by lead time, fill target, pallets per area, order rules, customer names. Saved in the browser. |
+
+**The Excel file** has two sheets. **Pick Plan** has the trailer rows in the hand-made layout, with coloured status, wrapped order lists, filters and a frozen header. **Orders** has one row per order with order ID, wave, customer, due time and release status, for the admin to release from.
+
+**Warnings on a trailer:** *over capacity*, *arrives late* (an order due before the trailer delivers), *going early* (pulled forward), *for another customer* (a shared or OTM trailer), *customer collection*, and *pick-by time has passed*.
 
 Nothing is uploaded anywhere. Files are read in the browser.
 
@@ -39,7 +52,13 @@ Nothing is uploaded anywhere. Files are read in the browser.
 
 **Home trailer.** An order goes on the trailer whose wave number is written in the transport plan's "TRL / Load Check" column. Otherwise it goes on the trailer for the same customer and delivery time. If there is no trailer at that time, it goes on the latest trailer before it.
 
-**Shopping.** For each customer, trailers are worked from the earliest. A trailer that already has orders, is under the target (85%), and is more than an hour from its paperwork time takes later orders, earliest due first. It never goes over 100%. By default an order is only pulled:
+**Picked by.** Paperwork time ("Loaded by" on the pick plan) minus 2 hours, editable under Rules.
+
+**Which trailers are listed.** Every customer trailer in the transport plan. Transfers, collections and decant trailers are left out. X-Dock trailers and trailers from other sites (e.g. ATL Marchington) are shown greyed. They are never suggested, but orders can be put on them by hand.
+
+**Suggestions.** Every order is suggested for its home trailer. Orders already on the list stay where they were put, and the suggestions for everything else work around them. On top of that:
+
+**Pulling forward.** For each customer, trailers are worked from the earliest. A trailer that already has orders, is under the target (85%), and is more than an hour from its paperwork time takes later orders, earliest due first. It never goes over 100%. By default an order is only pulled:
 
 - from the same delivery day,
 - from at most 16 hours later,
@@ -47,13 +66,11 @@ Nothing is uploaded anywhere. Files are read in the browser.
 
 A trailer whose orders have all moved is flagged **Maybe not needed**. It is never refilled.
 
-**Transport plan days.** The schedule repeats every day except Friday. If the plan has no sheet for the date, the same weekday in the file is used. Otherwise any Mon–Thu sheet is used, but a Friday only ever uses a Friday. Waves and loading status are ignored for a borrowed day.
+**Transport plan days.** Mon–Thu share one schedule. If the plan has no sheet for a date, the most recent Mon–Thu sheet is used (a Friday only uses a Friday). Waves and loading status are ignored for a borrowed day, and its trailers are marked "Expected". The next day's sheet is always read too, because its first rows are the 00:00 trailers, which belong to the day before.
 
 **Midnight.** A delivery at 00:00 counts as 23:59 on the day before.
 
 **X-Dock.** X-Dock trailers belong to the X-Dock department, so orders aren't planned onto them. When one of our trailers stays under target, or an order has no trailer, and an X-Dock trailer goes to the same customer around that time, it's listed under **Could share with X-Dock**. A Rules switch plans onto X-Dock trailers like our own.
-
-**Grouping.** Orders on the same wave that go to the same trailer are one line (e.g. 38 Cabs kits).
 
 ## Command line (for automation)
 
@@ -75,7 +92,7 @@ npm test
 npm run build
 ```
 
-`src/core.js` holds the parsing and planning logic and has no DOM code. `src/app.js` is the UI. `src/sample.js` is made-up example data in the same layout as the real exports. Real exports are git-ignored because this repository is public.
+`src/core.js` holds the parsing, planning and list logic and has no DOM code. `src/xlsx-out.js` writes the styled Excel file. `src/app.js` is the UI. `src/sample.js` is made-up example data in the same layout as the real exports. Real exports are git-ignored because this repository is public.
 
 ## Ideas for next steps
 

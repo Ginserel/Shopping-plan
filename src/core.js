@@ -54,11 +54,13 @@
     sameDayOnly: true, // only pull orders delivering on the same day as the trailer
     leadMinutes: 60, // stop shopping into a trailer this long before its paperwork time
     protectSources: true, // don't take orders off a trailer that is already full enough
-    includeKitting: true,
-    xdockKinds: 'x-dock', // X-Dock department trailers: not ours, but suggested for sharing
+    includeKitting: false, // kitting is planned separately
+    ignoreOrders: 'decant', // order type / seller order ID matching this is left out (decant)
+    pickLeadMinutes: 120, // "Picked by" = paperwork ("Loaded by") minus this
+    xdockKinds: '^\\s*x-?dock(?!\\s*[/+])', // X-Dock department trailers ("X-Dock", "XDOCK", not "XDOCK / BLOWOUT"): not ours
     useXdock: false, // true = plan our orders onto X-Dock trailers like our own
     ourSite: 'emg|maersk', // "Delivery / Collection From" values that are our trailers
-    skipKinds: 'transfer|collection|emg to cover', // delivery types that are not our customer trailers
+    skipKinds: 'transfer|collection|emg to cover|decant', // delivery types that are not our customer trailers
     noShopKinds: 'live tip', // delivery types that keep their own orders but take nothing extra
     collectionMatch: 'coll|customer to collect', // orders the customer collects
     templateDay: null, // force a transport day (YYYY-MM-DD) as template; null = automatic
@@ -388,13 +390,15 @@
     const forced = isoToDay(cfg.templateDay);
     if (forced != null && transport.days.some((d) => d.day === forced)) return forced;
     if (transport.days.some((d) => d.day === day)) return day;
-    // The schedule repeats every weekday; Fridays (and weekends) are their own.
+    // Mon–Thu share one schedule, so the most recent Mon–Thu sheet is the best guess.
+    // Fridays and weekends only use their own weekday.
     const wd = weekday(day);
     const normal = (d) => ['Mon', 'Tue', 'Wed', 'Thu'].includes(weekday(d.day));
-    let pool = transport.days.filter((d) => weekday(d.day) === wd);
-    if (!pool.length && ['Mon', 'Tue', 'Wed', 'Thu'].includes(wd)) pool = transport.days.filter(normal);
+    let pool = ['Mon', 'Tue', 'Wed', 'Thu'].includes(wd) ? transport.days.filter(normal) : transport.days.filter((d) => weekday(d.day) === wd);
     if (!pool.length) pool = transport.days;
-    return pool.length ? pool[pool.length - 1].day : null;
+    const before = pool.filter((d) => d.day < day);
+    const list = before.length ? before : pool;
+    return list.length ? list[list.length - 1].day : null;
   }
 
   function slotsForDays(transport, dayList, cfg) {
@@ -408,6 +412,7 @@
       const shift = (day - src) * DAY;
       for (const s of transport.slots) {
         if (s.day !== src) continue;
+        if (s.delivery == null) continue;
         if (!exact && s.section !== 'main') continue; // one-off extras don't repeat
         const mv = (t) => (t == null ? null : t + shift);
         out.push({
@@ -425,6 +430,15 @@
         });
       }
     }
+    // A stable name for each trailer, so choices survive loading a newer export.
+    const seen = new Map();
+    out.sort((a, b) => a.delivery - b.delivery || a.row - b.row);
+    for (const s of out) {
+      const base = `${dayToISO(Math.floor(s.delivery / DAY))} ${fmtTime(s.delivery)} ${clean(s.to)} ${clean(s.kind)}`;
+      const n = (seen.get(base) || 0) + 1;
+      seen.set(base, n);
+      s.key = n > 1 ? `${base} #${n}` : base;
+    }
     return { slots: out, used };
   }
 
@@ -440,8 +454,14 @@
     const xdRx = cfg.xdockKinds ? rx(cfg.xdockKinds) : /$^/;
 
     /* orders */
+    const ignoreRx = cfg.ignoreOrders ? rx(cfg.ignoreOrders) : null;
+    const ignored = { kitting: 0, other: 0 };
     const orders = picking.orders
-      .filter((o) => cfg.includeKitting || !/kit/i.test(o.section))
+      .filter((o) => {
+        if (!cfg.includeKitting && /kit/i.test(o.section)) { ignored.kitting++; return false; }
+        if (ignoreRx && (ignoreRx.test(o.type) || ignoreRx.test(o.seller))) { ignored.other++; return false; }
+        return true;
+      })
       .map((o) => {
         const size = sizeOrder(o, cfg, overrides[o.id]);
         return {
@@ -454,17 +474,21 @@
       });
 
     /* trailer slots for every day that has orders (and today) */
-    const daySet = new Set(orders.map((o) => Math.floor(o.delivery / DAY)));
+    // Day + 1 too: its first rows are the 00:00 trailers, which count as 23:59 the day before.
+    const daySet = new Set();
+    for (const o of orders) { const d = Math.floor(o.delivery / DAY); daySet.add(d); daySet.add(d + 1); }
     daySet.add(Math.floor(now / DAY));
+    daySet.add(Math.floor(now / DAY) + 1);
     const { slots: rawSlots, used } = slotsForDays(transport, [...daySet].sort((a, b) => a - b), cfg);
-    const candidates = rawSlots
-      .map((s) => ({
-        ...s,
-        customer: customerOf(s.to, cfg),
-        ours: !s.from || siteRx.test(s.from),
-        xdock: xdRx.test(s.kind),
-      }))
-      .filter((s) => s.ours && s.customer && s.delivery != null && !skipRx.test(s.kind) && !/external|transfer/i.test(s.loadType));
+    const mapped = rawSlots.map((s) => ({
+      ...s,
+      customer: customerOf(s.to, cfg),
+      ours: !s.from || siteRx.test(s.from),
+      xdock: xdRx.test(s.kind),
+      pickBy: s.paperwork != null ? s.paperwork - (cfg.pickLeadMinutes || 0) : null,
+    }));
+    const isTrailer = (s) => s.customer && s.delivery != null && !skipRx.test(s.kind) && !/external|transfer/i.test(s.loadType);
+    const candidates = mapped.filter((s) => s.ours && isTrailer(s));
     // X-Dock trailers belong to another department: kept aside to suggest sharing.
     const xdock = candidates.filter((s) => s.xdock && !cfg.useXdock && !s.gone && s.delivery > now);
     const slots = candidates
@@ -497,11 +521,23 @@
     };
     const leastLoaded = (list) => list.reduce((best, s) => (!best || s.load < best.load ? s : best), null);
 
+    /* 0. the planner's own choices are fixed; suggestions work around them */
+    const fixed = opts.fixed || {};
+    const slotByKey = new Map(slots.map((s) => [s.key, s]));
+    for (const o of orders) {
+      const k = fixed[o.id];
+      if (!k) continue;
+      o.fixed = k;
+      o.locked = true;
+      const s = slotByKey.get(k);
+      if (s) { o.home = s.id; put(o, s); }
+    }
+
     /* 1. home trailer: wave written on the plan, else same customer + delivery time */
     const homeless = [];
     const sorted = [...orders].sort((a, b) => b.frac - a.frac);
     for (const o of sorted) {
-      if (o.collection || !o.customer) continue;
+      if (o.fixed || o.collection || !o.customer) continue;
       let s = leastLoaded(slots.filter((x) => o.wave && x.waves.includes(o.wave)));
       if (!s) s = leastLoaded((byCustomer.get(o.customer) || []).filter((x) => x.delivery === o.delivery));
       if (s) { o.home = s.id; put(o, s); } else homeless.push(o);
@@ -526,7 +562,7 @@
     /* 3. missed trailers: home trailer gone/past but picks still open -> roll to next */
     for (const o of orders) {
       const s = o.slot && slotById.get(o.slot);
-      if (!s || !s.past || o.remaining <= 0) continue;
+      if (!s || !s.past || o.remaining <= 0 || o.fixed) continue;
       const next = (byCustomer.get(o.customer) || []).find((x) => !x.past && x.delivery > s.delivery && !x.noShop);
       if (next) move(o, next, 'roll', `Missed ${fmtTime(s.delivery)} trailer`);
       else o.note = `Missed ${fmtTime(s.delivery)} trailer – no later trailer in plan`;
@@ -586,6 +622,7 @@
       .sort((a, b) => Math.abs(a.delivery - abs) - Math.abs(b.delivery - abs));
     const xdText = (list) => list.length ? ` X-Dock trailer at ${list.slice(0, 2).map((x) => fmtTime(x.delivery)).join(' / ')} – ask X-Dock if it can take it.` : '';
     for (const o of orders) {
+      if (o.fixed) { if (o.decide) ex.push({ kind: 'decide', order: o, text: `${o.rule}: set how much of a trailer this takes` }); continue; }
       if (o.collection) ex.push({ kind: 'collection', order: o, text: 'Customer collection – not on our trailers' });
       else if (!o.customer) ex.push({ kind: 'customer', order: o, text: `Unknown customer "${o.company}" – add it under Rules › Customers` });
       else if (!o.slot) ex.push({ kind: 'noslot', order: o, text: `No ${o.customer} trailer in the transport plan for ${fmtDay(o.delivery)}.${xdText(xdockNear(o.customer, o.delivery, 3))}` });
@@ -634,8 +671,15 @@
       .map((m) => ({ ...m, slot: slotById.get(m.to), fromSlot: m.from ? slotById.get(m.from) : null }))
       .sort((a, b) => (a.slot.paperwork || a.slot.delivery) - (b.slot.paperwork || b.slot.delivery));
 
+    /* every customer trailer in the plan, for the planner's board */
+    const board = mapped.filter(isTrailer).map((s) => {
+      const planned = slotById.get(s.id);
+      if (planned) return Object.assign(planned, { role: 'ours' });
+      return { ...s, role: s.xdock ? 'xdock' : 'other', orders: [], load: 0, past: s.gone || s.delivery <= now, verdict: 'empty' };
+    }).sort((a, b) => (a.paperwork != null ? a.paperwork : a.delivery) - (b.paperwork != null ? b.paperwork : b.delivery) || a.delivery - b.delivery || a.row - b.row);
+
     return {
-      now, cfg, orders, slots, xdock, used, moves, shopping, exceptions: ex,
+      now, cfg, orders, slots, board, ignored, xdock, used, moves, shopping, exceptions: ex,
       unconfirmedAreas: [...usedAreaCaps],
       summary: {
         orders: orders.length,
@@ -650,6 +694,109 @@
         over: upcoming.filter((s) => s.verdict === 'over').length,
       },
     };
+  }
+
+  /* ------------------------ the planner's list ----------------------- */
+  // Where an order is in picking: picked / picking / released / release (still to release).
+  function orderState(o) {
+    if (o.remaining <= 0 && o.total > 0) return 'picked';
+    if (o.remaining < o.total || /progress/i.test(o.status)) return 'picking';
+    if (/released/i.test(o.release) && !/not/i.test(o.release)) return 'released';
+    return 'release';
+  }
+  const STATE_TEXT = { picked: 'Picked', picking: 'Pick in progress', released: 'Released', release: 'To release' };
+
+  function dur(mins) {
+    mins = Math.round(Math.abs(mins));
+    const h = Math.floor(mins / 60), m = mins % 60;
+    return h && m ? `${h}h ${m}m` : h ? `${h}h` : `${m}m`;
+  }
+
+  function reasonFor(o, s) {
+    if (o.moveType === 'shop') return { kind: 'shop', text: `Pull forward from ${fmtTime(o.delivery)} to fill this trailer` };
+    if (o.moveType === 'noslot') return { kind: 'noslot', text: o.note };
+    if (o.moveType === 'roll') return { kind: 'roll', text: o.note };
+    if (o.wave && s.waves && s.waves.includes(o.wave)) return { kind: 'home', text: `Wave ${o.wave} is written on this trailer` };
+    return { kind: 'home', text: `Due ${fmtTime(o.delivery)}` };
+  }
+
+  // assign: { orderId: trailer key } – the planner's choices. Returns one row per trailer
+  // (chosen orders, suggestions, fill, status, warnings) and the orders not on the list.
+  function buildList(r, assign) {
+    assign = assign || {};
+    const cfg = r.cfg;
+    const rows = new Map();
+    for (const s of r.board) rows.set(s.key, { key: s.key, slot: s, chosen: [], suggested: [], load: 0, sugLoad: 0, warnings: [] });
+    const byId = new Map(r.board.map((s) => [s.id, s]));
+    const pool = [];
+    for (const o of r.orders) {
+      const k = assign[o.id];
+      const row = k && rows.get(k);
+      if (row) { row.chosen.push(o); row.load += o.frac; continue; }
+      const s = o.slot && byId.get(o.slot);
+      const sug = s && !s.past ? { slot: s, key: s.key, reason: reasonFor(o, s) } : null;
+      pool.push({ order: o, suggestion: sug, missing: k || null });
+      if (sug) {
+        const rr = rows.get(s.key);
+        rr.suggested.push({ order: o, reason: sug.reason });
+        rr.sugLoad += o.frac;
+      }
+    }
+    for (const row of rows.values()) {
+      const s = row.slot;
+      row.chosen.sort((a, b) => a.delivery - b.delivery || a.seller.localeCompare(b.seller));
+      row.suggested.sort((a, b) => a.order.delivery - b.order.delivery);
+      row.notes = new Map();
+      for (const o of row.chosen) {
+        const n = [];
+        if (o.delivery < s.delivery - 1) n.push({ kind: 'late', text: `Due ${fmtTime(o.delivery)} – arrives ${dur(s.delivery - o.delivery)} late` });
+        else if (o.delivery > s.delivery + 1) n.push({ kind: 'early', text: `Due ${Math.floor(o.delivery / DAY) === Math.floor(s.delivery / DAY) ? fmtTime(o.delivery) : fmtDayTime(o.delivery)} – going early` });
+        if (o.collection) n.push({ kind: 'warn', text: 'Customer collection' });
+        else if (o.customer !== s.customer) n.push({ kind: 'info', text: `For ${o.customer || o.company}` });
+        if (o.decide) n.push({ kind: 'warn', text: 'Size is a guess – set it on the Orders tab' });
+        row.notes.set(o.id, n);
+      }
+      const states = row.chosen.map(orderState);
+      row.picks = row.chosen.reduce((t, o) => t + o.total, 0);
+      row.picksLeft = row.chosen.reduce((t, o) => t + o.remaining, 0);
+      row.pallets = row.chosen.reduce((t, o) => t + o.pallets, 0);
+      row.toRelease = row.chosen.filter((o) => orderState(o) === 'release');
+      row.waves = [...new Set(row.toRelease.map((o) => o.wave).filter(Boolean))];
+      row.status = !states.length ? ''
+        : states.every((x) => x === 'picked') ? STATE_TEXT.picked
+        : states.some((x) => x === 'picked' || x === 'picking') ? STATE_TEXT.picking
+        : states.every((x) => x === 'released') ? STATE_TEXT.released
+        : `${STATE_TEXT.release}${row.toRelease.length < states.length ? ` (${row.toRelease.length} of ${states.length})` : ''}`;
+      if (row.load > cfg.maxFill + 1e-9) row.warnings.push({ kind: 'over', text: `Over capacity – about ${Math.ceil(row.load / cfg.maxFill - 1e-9)} trailers' worth` });
+      if (row.chosen.some((o) => row.notes.get(o.id).some((n) => n.kind === 'late'))) row.warnings.push({ kind: 'late', text: 'Has orders that will arrive late' });
+      if (s.pickBy != null && s.pickBy <= r.now && !s.past && states.some((x) => x !== 'picked')) row.warnings.push({ kind: 'late', text: 'Pick-by time has passed' });
+      if (s.role !== 'ours' && row.chosen.length) row.warnings.push({ kind: 'info', text: s.role === 'xdock' ? 'X-Dock trailer – check with X-Dock' : `Trailer from ${s.from}` });
+    }
+    pool.sort((a, b) => a.order.delivery - b.order.delivery || (a.order.customer || '~').localeCompare(b.order.customer || '~'));
+    return { rows: [...rows.values()], pool };
+  }
+
+  // The admin's pick plan, in the same columns as the hand-made sheet plus what the admin needs
+  // to release. rows: buildList(...).rows already filtered and in order. comments: { key: text }.
+  const PICK_PLAN_HEAD = ['Deliver To', 'Delivery Type', 'Picked By', 'Loaded By', 'Delivery Time', 'Orders to pick', 'Status', 'Comments', 'Waves to release', 'Picks left', 'Trailer fill'];
+  function pickPlanTable(rows, comments) {
+    comments = comments || {};
+    return rows.map((row) => {
+      const s = row.slot;
+      const orders = row.chosen.map((o) => o.seller || o.id.replace(/^0+/, ''));
+      const tag = s.role === 'xdock' && !/x-?dock/i.test(s.kind || '') ? ' (X-Dock)' : s.role === 'other' && s.from ? ` (from ${s.from})` : '';
+      return {
+        row,
+        cells: [
+          s.to, (s.kind || '') + tag,
+          s.pickBy != null && s.role === 'ours' || row.chosen.length ? fmtTime(s.pickBy) : '',
+          fmtTime(s.paperwork), fmtTime(s.delivery),
+          orders.join('\n'), row.status, comments[row.key] || '',
+          row.waves.join('\n'), row.chosen.length ? row.picksLeft : '',
+          row.chosen.length ? `${Math.round(row.load * 100)}%` : '',
+        ],
+      };
+    });
   }
 
   // Shopping lines for the same wave going to the same trailer are picked together.
@@ -701,6 +848,7 @@
 
   return {
     DAY, DEFAULT_CONFIG, parsePicking, parseTransport, plan, sizeOrder, customerOf, detect, groupShopping,
+    buildList, orderState, STATE_TEXT, dur, pickPlanTable, PICK_PLAN_HEAD,
     fmtTime, fmtDay, fmtDayTime, absToLocalInput, localInputToAbs, dayToISO, isoToDay, weekday,
     _internal: { parseDay, parseTime, parseDateTime, parseLate, chooseTemplateDay },
   };

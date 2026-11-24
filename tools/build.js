@@ -19,7 +19,7 @@ function inline(page, { cdn }) {
   return page
     .replace('<link rel="stylesheet" href="style.css">', () => `<style>\n${css}\n</style>`)
     .replace('<script src="../vendor/xlsx.full.min.js"></script>', () => (cdn ? `<script src="${CDN}"></script>` : `<script>\n${vendor}\n</script>`))
-    .replace(/<script src="([a-z]+\.js)"><\/script>/g, (_, f) => `<script>\n${js(f)}\n</script>`);
+    .replace(/<script src="([a-z-]+\.js)"><\/script>/g, (_, f) => `<script>\n${js(f)}\n</script>`);
 }
 
 fs.mkdirSync(path.join(root, 'dist'), { recursive: true });

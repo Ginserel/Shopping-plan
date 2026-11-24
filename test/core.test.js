@@ -77,9 +77,9 @@ test('collections stay off our trailers', () => {
   assert.strictEqual(o.slot, null);
 });
 
-test('uses the same weekday as a template when the date is missing', () => {
+test('uses the latest Mon-Thu sheet as a template when the date is missing', () => {
   const p = run({ templateDay: null }, { now: SP.localInputToAbs('2026-11-30T16:30') });
-  assert.ok(p.used.some((u) => SP.dayToISO(u.day) === '2026-11-30' && !u.exact && SP.dayToISO(u.source) === '2026-11-23'));
+  assert.ok(p.used.some((u) => SP.dayToISO(u.day) === '2026-11-30' && !u.exact && SP.dayToISO(u.source) === '2026-11-24'));
 });
 
 test('boxes: Mothersons and Mezzanine are 18 picks per pallet', () => {
@@ -93,8 +93,23 @@ test('P&D picks are not counted twice', () => {
   assert.strictEqual(o.pallets, 12);
 });
 
-test('kits: 16 orders to a pallet, and kit lines group by wave', () => {
+test('kitting is left out by default', () => {
   const p = run();
+  assert.ok(!p.orders.some((o) => /kit/i.test(o.section)));
+  assert.strictEqual(p.ignored.kitting, 14);
+});
+
+test('decant orders and decant trailers are left out', () => {
+  const rows = S.picking();
+  const h = rows.findIndex((r) => r[0] === 'Delivery Date');
+  rows[h + 1][6] = '4 - Decant';
+  const p = SP.plan(SP.parsePicking(rows), transport, {}, {});
+  assert.strictEqual(p.ignored.other, 1);
+  assert.ok(!p.board.some((s) => /decant/i.test(s.kind)));
+});
+
+test('kits: 16 orders to a pallet, and kit lines group by wave', () => {
+  const p = run({ includeKitting: true });
   const kits = p.orders.filter((o) => o.rule === 'Cabs kits');
   assert.strictEqual(kits.length, 12);
   assert.ok(Math.abs(kits[0].pallets - 1 / 16) < 1e-9);
@@ -125,4 +140,69 @@ test('an order due at 00:00 counts as 23:59 the day before', () => {
   rows[h + 1][0] = '25/11/2026 00:00';
   const o = SP.parsePicking(rows).orders[0];
   assert.strictEqual(SP.fmtDayTime(o.delivery), 'Tue 24/11 23:59');
+});
+
+test('the board lists every customer trailer, X-Dock included, with pick-by 2h before paperwork', () => {
+  const p = run();
+  const xd = p.board.find((s) => s.customer === 'Heavy' && s.kind === 'X-Dock');
+  assert.strictEqual(xd.role, 'xdock');
+  const cp = p.board.find((s) => s.customer === 'Compact' && /MH SO/.test(s.kind) && SP.fmtTime(s.delivery) === '07:30');
+  assert.strictEqual(cp.role, 'ours');
+  assert.strictEqual(SP.fmtTime(cp.pickBy), SP.fmtTime(cp.paperwork - 120));
+  assert.strictEqual(new Set(p.board.map((s) => s.key)).size, p.board.length, 'trailer keys are unique');
+});
+
+test('suggestions: every planned order is suggested on its trailer until chosen', () => {
+  const p = run();
+  const L = SP.buildList(p, {});
+  const o = bySeller(p, 'CP PNT 241126');
+  const row = L.rows.find((r) => r.suggested.some((x) => x.order === o));
+  assert.strictEqual(row.slot.id, o.slot);
+  assert.strictEqual(row.suggested.find((x) => x.order === o).reason.kind, 'shop');
+  assert.ok(L.pool.some((x) => x.order === o));
+});
+
+test('chosen orders stay where the planner put them and suggestions work around them', () => {
+  const p0 = run();
+  const o = bySeller(p0, 'CP PNT 241126');
+  const late = p0.board.find((s) => s.customer === 'Compact' && SP.fmtDayTime(s.delivery) === 'Tue 24/11 18:00' && /MH SO/.test(s.kind));
+  const assign = { [o.id]: late.key };
+  const p = run({}, { fixed: assign });
+  const L = SP.buildList(p, assign);
+  const row = L.rows.find((r) => r.key === late.key);
+  assert.ok(row.chosen.some((x) => x.id === o.id));
+  assert.ok(!L.pool.some((x) => x.order.id === o.id));
+  assert.ok(!L.rows.some((r) => r.suggested.some((x) => x.order.id === o.id)), 'not suggested anywhere else');
+  assert.strictEqual(bySeller(p, 'CP PNT 241126').slot, late.id);
+});
+
+test('list rows flag late orders and give a status the admin can act on', () => {
+  const p0 = run();
+  const o = bySeller(p0, 'PS-241126-12PM'); // due 12:00, not released
+  const after = p0.board.find((s) => s.customer === 'Power Systems' && s.delivery > o.delivery && s.role === 'ours');
+  const assign = { [o.id]: after.key };
+  const L = SP.buildList(run({}, { fixed: assign }), assign);
+  const row = L.rows.find((r) => r.key === after.key);
+  assert.ok(row.notes.get(o.id).some((n) => n.kind === 'late'));
+  assert.ok(/^To release/.test(row.status));
+  assert.deepStrictEqual(row.waves, [o.wave]);
+});
+
+test('pick plan table and Excel export use the hand-made sheet columns', () => {
+  const XLSX = require('../vendor/xlsx.full.min.js');
+  const W = require('../src/xlsx-out.js');
+  const p0 = run();
+  const L0 = SP.buildList(p0, {});
+  const row0 = L0.rows.find((r) => r.suggested.length && r.slot.role === 'ours');
+  const assign = Object.fromEntries(row0.suggested.map((x) => [x.order.id, row0.key]));
+  const L = SP.buildList(run({}, { fixed: assign }), assign);
+  const row = L.rows.find((r) => r.key === row0.key);
+  const [line] = SP.pickPlanTable([row], { [row.key]: 'Bay 12' });
+  assert.deepStrictEqual(SP.PICK_PLAN_HEAD.slice(0, 8), ['Deliver To', 'Delivery Type', 'Picked By', 'Loaded By', 'Delivery Time', 'Orders to pick', 'Status', 'Comments']);
+  assert.strictEqual(line.cells[2], SP.fmtTime(row.slot.paperwork - 120));
+  assert.strictEqual(line.cells[5].split('\n').length, row.chosen.length);
+  assert.strictEqual(line.cells[7], 'Bay 12');
+  const bytes = W.build([{ name: 'Pick Plan', rows: [SP.PICK_PLAN_HEAD.map((v) => ({ v, s: 'head' })), line.cells.map((v) => ({ v, s: 'body' }))] }], XLSX.CFB);
+  const back = XLSX.utils.sheet_to_json(XLSX.read(bytes).Sheets['Pick Plan'], { header: 1 });
+  assert.strictEqual(back[1][5], line.cells[5]);
 });
