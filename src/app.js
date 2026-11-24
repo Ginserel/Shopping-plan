@@ -17,14 +17,14 @@
   const state = {
     picking: null, pickingName: '', pickingSample: true,
     transport: null, transportName: '', transportSample: true,
-    cfg: Object.assign(clone(SP.DEFAULT_CONFIG), store.get('sp.cfg.v1', {})),
+    cfg: Object.assign(clone(SP.DEFAULT_CONFIG), store.get('sp.cfg.v2', {})),
     overrides: store.get('sp.overrides.v1', {}),
     done: store.get('sp.done.v1', {}),
     now: null, nowFromFile: true,
     tab: 'shopping', customer: '', showEmpty: false, showPast: false,
     message: null, result: null,
   };
-  const saveCfg = () => store.set('sp.cfg.v1', state.cfg);
+  const saveCfg = () => store.set('sp.cfg.v2', state.cfg);
   const saveOverrides = () => store.set('sp.overrides.v1', state.overrides);
   const saveDone = () => store.set('sp.done.v1', state.done);
 
@@ -39,7 +39,8 @@
 
   /* ---------------------------- helpers ----------------------------- */
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-  const pct = (f) => `${Math.round(f * 100)}%`;
+  const pct = (f) => (f > 0 && f < 0.005 ? '<1%' : `${Math.round(f * 100)}%`);
+  const pal = (n) => (n >= 10 ? Math.round(n) : n >= 1 ? n.toFixed(1).replace(/\.0$/, '') : n > 0 ? '<1' : '0');
   const t = SP.fmtTime;
   function when(abs, refDay) {
     if (abs == null) return '–';
@@ -146,7 +147,7 @@
           <span class="small muted">${tr.slots.length} rows · trailers for ${esc(used || 'no matching day')}</span>
         </div>
       </section>
-      ${r.used.some((u) => !u.exact) ? `<div class="banner warn">The transport plan has no sheet for ${r.used.filter((u) => !u.exact).map((u) => SP.fmtDay(u.day * DAY)).join(', ')}, so trailer times come from the same weekday in the file. Load today's transport plan to use the real trailers and wave numbers.</div>` : ''}
+      ${r.used.some((u) => !u.exact) ? `<div class="banner warn">No sheet in the transport plan for ${r.used.filter((u) => !u.exact).map((u) => `${SP.fmtDay(u.day * DAY)} (using ${SP.fmtDay(u.source * DAY)})`).join(', ')}. The schedule repeats every day except Friday, so trailer times are taken from another day. Load today's plan to also match the wave numbers written on it.</div>` : ''}
       ${r.unconfirmedAreas.length ? `<div class="banner warn">Trailer capacity for ${r.unconfirmedAreas.map(esc).join(', ')} is a guess. Check it under Rules.</div>` : ''}
     `;
   }
@@ -167,10 +168,11 @@
 
   function viewKpis(r) {
     const s = r.summary;
+    const lines = SP.groupShopping(r.shopping).length;
     const decide = r.exceptions.filter((e) => ['decide', 'over', 'big', 'noslot', 'missed', 'customer'].includes(e.kind)).length;
     return `
       <section class="kpis">
-        <div class="kpi attn"><span class="label">Orders to pick early</span><span class="v">${s.moves}</span><span class="small muted">to fill trailers that leave sooner</span></div>
+        <div class="kpi attn"><span class="label">Lines to pick early</span><span class="v">${lines}</span><span class="small muted">${s.moves} order${s.moves === 1 ? '' : 's'}, to fill trailers that leave sooner</span></div>
         <div class="kpi ${s.under ? 'warn' : ''}"><span class="label">Trailers under ${pct(r.cfg.targetFill)}</span><span class="v">${s.under} <small>was ${s.underBefore}</small></span><span class="small muted">of ${s.trailers - s.empty} running</span></div>
         <div class="kpi attn"><span class="label">Trailers maybe not needed</span><span class="v">${s.freed}</span><span class="small muted">all their orders go earlier</span></div>
         <div class="kpi ${decide ? 'bad' : ''}"><span class="label">Need a decision</span><span class="v">${decide}</span><span class="small muted">see Exceptions</span></div>
@@ -179,7 +181,7 @@
 
   function viewTabs(r) {
     const ex = r.exceptions.filter((e) => e.kind !== 'collection' && e.kind !== 'estimate').length;
-    const tabs = [['shopping', 'Shopping list', r.shopping.length], ['trailers', 'Trailers', null], ['exceptions', 'Exceptions', ex], ['orders', 'Orders', r.orders.length], ['rules', 'Rules', null]];
+    const tabs = [['shopping', 'Shopping list', SP.groupShopping(r.shopping).length], ['trailers', 'Trailers', null], ['exceptions', 'Exceptions', ex], ['orders', 'Orders', r.orders.length], ['rules', 'Rules', null]];
     return `<nav class="tabs" role="tablist">${tabs.map(([k, label, n]) => `<button class="tab" role="tab" data-tab="${k}" aria-selected="${state.tab === k}">${label}${n != null ? `<span class="count">${n}</span>` : ''}</button>`).join('')}</nav>`;
   }
 
@@ -187,34 +189,39 @@
   const planDay = () => Math.floor(state.now / DAY) + (state.now % DAY >= 12 * 60 ? 1 : 0);
 
   function viewShopping(r) {
-    const rows = r.shopping.filter((m) => custOk(m.order.customer));
+    const rows = SP.groupShopping(r.shopping.filter((m) => custOk(m.order.customer)));
     if (!rows.length) return `<div class="empty-state">Nothing to shop. Every running trailer is full enough, or nothing later can go on it.</div>`;
     const ref = planDay();
     let lastKey = null;
-    const body = rows.map((m) => {
-      const o = m.order, s = m.slot;
+    const body = rows.map((g) => {
+      const o = g.order, s = g.slot, many = g.orders.length > 1;
       const key = s.paperwork != null ? s.paperwork : s.delivery;
       let group = '';
       if (key !== lastKey) {
         lastKey = key;
-        group = `<tr class="group"><td colspan="8">Paperwork by ${when(key, ref)} – ${esc(s.customer)} ${t(s.delivery)} trailer, now ${pct(s.load)} full</td></tr>`;
+        group = `<tr class="group"><td colspan="8">Paperwork by ${when(key, ref)} – ${esc(s.customer)} ${t(s.delivery)} trailer, now ${pct(s.load)} full (≈ ${pal(s.pallets)} pallets)</td></tr>`;
       }
-      const [mLabel, mClass] = MOVE[m.type] || ['Moved', ''];
-      const done = !!state.done[o.id];
+      const [mLabel, mClass] = MOVE[g.type] || ['Moved', ''];
+      const ids = g.orders.map((x) => x.id);
+      const done = ids.every((id) => state.done[id]);
+      const areas = many ? '' : areaChips(o);
+      const name = many
+        ? `<span class="ref">${g.orders.length} ${esc(o.type.replace(/^\d+\s*-\s*/, '') || 'orders')} orders</span><div class="small muted mono">Wave ${esc(o.wave)} · ${esc(g.orders[0].seller)} … ${esc(g.orders[g.orders.length - 1].seller)}</div>`
+        : `<span class="ref">${esc(o.seller || o.id)}</span><div class="small muted mono">Order ${esc(o.id.replace(/^0+/, ''))} · Wave ${esc(o.wave)}</div>`;
       return `${group}<tr class="${done ? 'done' : ''}">
-        <td><input type="checkbox" data-done="${esc(o.id)}" ${done ? 'checked' : ''} aria-label="Mark ${esc(o.seller)} as sent to picking"></td>
+        <td><input type="checkbox" data-done="${esc(ids.join(','))}" ${done ? 'checked' : ''} aria-label="Mark as sent to picking"></td>
         <td><span class="t">${when(key, ref)}</span><div class="small muted">paperwork</div></td>
         <td><strong>${esc(s.customer)} ${t(s.delivery)}</strong><div class="small muted">${esc(s.kind)}${s.despatch != null ? ` · desp ${t(s.despatch)}` : ''}</div></td>
-        <td><span class="ref">${esc(o.seller || o.id)}</span><div class="small muted mono">Order ${esc(o.id.replace(/^0+/, ''))} · Wave ${esc(o.wave)}</div></td>
+        <td>${name}</td>
         <td><span class="mono">${when(o.delivery, ref)}</span><div><span class="chip ${mClass}">${mLabel}</span></div></td>
-        <td><span class="mono">${o.remaining} / ${o.total}</span>${areaChips(o)}</td>
-        <td class="num mono">+${pct(o.frac)}</td>
+        <td><span class="mono">${g.remaining} / ${g.total}</span>${areas}</td>
+        <td class="num mono">+${pct(g.frac)}<div class="small muted">≈ ${pal(g.pallets)} pal</div></td>
         <td class="action">${action(o, s)}</td>
       </tr>`;
     }).join('');
     return `
       <div class="panel-head">
-        <p class="muted small">Ordered by when the trailer's paperwork is due. Tick an order once picking have it.</p>
+        <p class="muted small">Ordered by when the trailer's paperwork is due. Orders on the same wave are one line. Tick a line once picking have it.</p>
         <button class="btn" data-act="copy">Copy for Excel / Teams</button>
       </div>
       <div class="table-box"><table>
@@ -227,16 +234,25 @@
     const own = Math.min(s.ownLoad, 1), shop = Math.min(Math.max(0, s.load - s.ownLoad), Math.max(0, 1 - own));
     const verdict = s.lostAll ? 'Maybe not needed' : VERDICT[s.verdict];
     const vclass = s.lostAll ? 'info' : VCLASS[s.verdict];
-    const lis = s.orders.slice().sort((a, b) => a.delivery - b.delivery).map((o) => {
+    const lines = [];
+    const byWave = new Map();
+    for (const o of s.orders.slice().sort((a, b) => a.delivery - b.delivery)) {
+      const k = o.rule && /kit/i.test(o.rule) ? `${o.wave}|${!!o.moveType}|${o.delivery}` : o.id;
+      if (byWave.has(k)) { const l = byWave.get(k); l.n++; l.frac += o.frac; l.rem += o.remaining; l.tot += o.total; continue; }
+      const l = { o, n: 1, frac: o.frac, rem: o.remaining, tot: o.total };
+      byWave.set(k, l); lines.push(l);
+    }
+    const lis = lines.map(({ o, n, frac, rem, tot }) => {
       const moved = o.moveType ? ` <span class="muted">(due ${when(o.delivery, ref)})</span>` : '';
-      return `<li class="${o.moveType ? 'in' : ''}"><span class="who">${esc(o.seller || o.id)}${moved}</span><span class="pct">${o.remaining}/${o.total} · ${pct(o.frac)}</span></li>`;
+      const who = n > 1 ? `${n} kit orders, wave ${esc(o.wave)}` : esc(o.seller || o.id);
+      return `<li class="${o.moveType ? 'in' : ''}"><span class="who">${who}${moved}</span><span class="pct">${rem}/${tot} · ${pct(frac)}</span></li>`;
     }).join('');
     const gone = r.moves.filter((m) => m.from === s.id && m.order.slot !== s.id);
     const goneTxt = gone.length ? `<p class="small muted">${gone.length} order${gone.length > 1 ? 's' : ''} moved to earlier trailers.</p>` : '';
     return `<article class="trailer v-${s.verdict} ${s.lostAll ? 'freed' : ''}">
       <header><span class="t">${when(s.delivery, ref)}</span><span class="kind">${esc(s.kind || 'Trailer')}</span><span class="chip ${vclass}">${verdict}</span></header>
       <div class="fill-row"><div class="bar ${s.load > r.cfg.maxFill ? 'over' : ''}" title="Solid: own orders · striped: shopped in"><span class="own" style="width:${own * 100}%"></span><span class="shop" style="width:${shop * 100}%"></span><i class="target" style="left:${target * 100}%"></i></div><span class="pct">${pct(s.load)}</span></div>
-      <dl><div><dt>Paperwork</dt><dd>${t(s.paperwork)}</dd></div><div><dt>Despatch</dt><dd>${t(s.despatch)}</dd></div><div><dt>Picks left</dt><dd>${s.picksLeft}</dd></div>${s.trailer ? `<div><dt>Trailer</dt><dd>${esc(s.trailer)}</dd></div>` : ''}</dl>
+      <dl><div><dt>Paperwork</dt><dd>${t(s.paperwork)}</dd></div><div><dt>Despatch</dt><dd>${t(s.despatch)}</dd></div><div><dt>Pallets</dt><dd>≈ ${pal(s.pallets)}</dd></div><div><dt>Picks left</dt><dd>${s.picksLeft}</dd></div>${s.trailer ? `<div><dt>Trailer</dt><dd>${esc(s.trailer)}</dd></div>` : ''}</dl>
       ${lis ? `<ul>${lis}</ul>` : ''}${goneTxt}
     </article>`;
   }
@@ -263,6 +279,7 @@
     ['big', 'Orders bigger than one trailer', ''],
     ['noslot', 'No trailer at the due time', 'The transport plan has no trailer for this customer at this time.'],
     ['missed', 'Missed trailers', 'The trailer has gone but picks are still open.'],
+    ['xdock', 'Could share with X-Dock', 'Our trailer is under target and an X-Dock trailer goes to the same customer around the same time.'],
     ['free', 'Trailers maybe not needed', 'All orders moved to earlier trailers. Check with transport before cancelling.'],
     ['customer', 'Unknown customers', 'Add a pattern for them under Rules › Customers.'],
     ['collection', 'Customer collections', 'Not planned on our trailers.'],
@@ -275,7 +292,7 @@
       if (!items.length) return '';
       return `<section class="ex-group"><h3>${title} <span class="muted small">${items.length}</span></h3>${help ? `<p class="muted small">${help}</p>` : ''}
         <ul class="ex-list">${items.map((e) => e.order
-          ? `<li><span class="what">${esc(e.order.seller || e.order.id)}</span><span class="muted small mono">${esc(e.order.customer || e.order.company)} · due ${when(e.order.delivery, ref)} · order ${esc(e.order.id.replace(/^0+/, ''))}</span><span>${esc(e.text)}</span></li>`
+          ? `<li><span class="what">${e.orders.length > 1 ? `${e.orders.length} orders on wave ${esc(e.order.wave)}` : esc(e.order.seller || e.order.id)}</span><span class="muted small mono">${esc(e.order.customer || e.order.company)} · due ${when(e.order.delivery, ref)}${e.orders.length > 1 ? '' : ` · order ${esc(e.order.id.replace(/^0+/, ''))}`}</span><span>${esc(e.text)}</span></li>`
           : `<li><span class="what">${esc(e.slot.customer)} ${when(e.slot.delivery, ref)} ${esc(e.slot.kind)}</span><span>${esc(e.text)}</span></li>`).join('')}</ul></section>`;
     }).join('');
     return parts || `<div class="empty-state">No exceptions.</div>`;
@@ -287,7 +304,7 @@
     const rows = r.orders.filter((o) => custOk(o.customer)).sort((a, b) => a.delivery - b.delivery || (a.customer || '').localeCompare(b.customer || ''));
     return `<p class="muted small">Set a trailer share by hand (for example Landpower engines that can't be stacked, or rubber-track machines). Tick "Keep" to stop an order being moved.</p>
       <div class="table-box"><table>
-      <thead><tr><th>Due</th><th>Customer</th><th>Order</th><th>Status</th><th>Picks left</th><th class="num">Trailer share</th><th>Set %</th><th>Keep</th><th>Planned on</th></tr></thead>
+      <thead><tr><th>Due</th><th>Customer</th><th>Order</th><th>Status</th><th>Picks left</th><th class="num">Pallets</th><th class="num">Trailer share</th><th>Set %</th><th>Keep</th><th>Planned on</th></tr></thead>
       <tbody>${rows.map((o) => {
         const s = o.slot && slotById.get(o.slot);
         const ov = state.overrides[o.id] || {};
@@ -298,6 +315,7 @@
           <td><span class="ref">${esc(o.seller || o.id)}</span><div class="small muted mono">Order ${esc(o.id.replace(/^0+/, ''))} · Wave ${esc(o.wave)}</div>${o.comments ? `<div class="small">${esc(o.comments)}</div>` : ''}</td>
           <td class="small">${esc(o.status)}<div class="muted">${esc(o.release)}</div></td>
           <td><span class="mono">${o.remaining} / ${o.total}</span>${areaChips(o)}</td>
+          <td class="num mono">${pal(o.pallets)}</td>
           <td class="num mono" title="${esc(o.basis)}">${pct(o.frac)}</td>
           <td><input type="number" min="0" max="400" step="5" data-pct="${esc(o.id)}" value="${ov.pct != null ? esc(ov.pct) : ''}" placeholder="auto" aria-label="Trailer share for ${esc(o.seller)}"></td>
           <td><input type="checkbox" data-lock="${esc(o.id)}" ${ov.lock ? 'checked' : ''} aria-label="Keep ${esc(o.seller)} on its own trailer"></td>
@@ -324,21 +342,23 @@
         ${chk('sameDayOnly', 'Only pull orders delivering the same day')}
         ${chk('protectSources', "Don't take orders off trailers that are already full enough")}
         ${chk('includeKitting', 'Include kitting orders (Cabs kits, Landpower kits, T4)')}
+        ${chk('useXdock', 'Plan our orders onto X-Dock trailers as if they were ours')}
       </section>
-      <section class="card"><h3>Picks per trailer by area</h3>
-        <p>How many picks from one area fill a trailer on their own. A mixed order adds up its share from each area. Patterns are matched against the area column names in the export.</p>
-        <div class="table-box"><table><thead><tr><th>Area</th><th>Column pattern</th><th class="num">Picks / trailer</th></tr></thead><tbody>
-        ${c.areas.map((a, i) => `<tr><td>${esc(a.name)}${a.confirm ? ' <span class="chip under">Guess</span>' : ''}</td><td><input type="text" data-area="${i}" data-k="match" value="${esc(a.match)}"></td><td class="num"><input type="number" min="1" data-area="${i}" data-k="cap" value="${a.cap}"></td></tr>`).join('')}
+      <section class="card"><h3>Pallets by picking area</h3>
+        <p>1 pick is 1 pallet, except box areas. A mixed order adds up its share of a trailer from each area. Untick "Count" for columns that repeat picks counted elsewhere (P&D is already in VNA).</p>
+        <div class="table-box"><table><thead><tr><th>Area</th><th>Column pattern</th><th class="num">Picks / pallet</th><th class="num">Pallets / trailer</th><th>Count</th></tr></thead><tbody>
+        ${c.areas.map((a, i) => `<tr><td>${esc(a.name)}</td><td><input type="text" data-area="${i}" data-k="match" value="${esc(a.match)}"></td><td class="num"><input type="number" min="1" data-area="${i}" data-k="perPallet" value="${a.perPallet}"></td><td class="num"><input type="number" min="1" data-area="${i}" data-k="perTrailer" value="${a.perTrailer}"></td><td><input type="checkbox" data-area="${i}" data-k="count" ${a.count === false ? '' : 'checked'} aria-label="Count ${esc(a.name)}"></td></tr>`).join('')}
         </tbody></table></div>
-        ${numField('defaultCap', 'Any other area', c.defaultCap, 1)}
+        ${numField('defaultPerTrailer', 'Pallets per trailer, any other area', c.defaultPerTrailer, 1)}
       </section>
       <section class="card"><h3>Order rules</h3>
-        <p>Rules for orders that don't follow the area numbers. The first rule that matches wins. "Decide" asks the admin to set the trailer share by hand.</p>
-        <div class="table-box"><table><thead><tr><th>Name</th><th>Look in</th><th>Contains</th><th class="num">Picks / trailer</th><th>Decide</th><th></th></tr></thead><tbody>
+        <p>For orders that don't follow the area numbers. The first rule that matches wins. Use "Pallets / trailer" for big items (16 shovels fill a trailer), or "Orders / pallet" for kits (16 small boxes on a pallet). "Decide" asks the admin to set the share by hand.</p>
+        <div class="table-box"><table><thead><tr><th>Name</th><th>Look in</th><th>Contains</th><th class="num">Pallets / trailer</th><th class="num">Orders / pallet</th><th>Decide</th><th></th></tr></thead><tbody>
         ${c.rules.map((ru, i) => `<tr><td><input type="text" data-rule="${i}" data-k="name" value="${esc(ru.name)}"></td>
-          <td><select data-rule="${i}" data-k="field">${['seller', 'company', 'comments'].map((f) => `<option value="${f}" ${ru.field === f ? 'selected' : ''}>${{ seller: 'Seller order ID', company: 'Company', comments: 'Comments' }[f]}</option>`).join('')}</select></td>
+          <td><select data-rule="${i}" data-k="field">${['seller', 'company', 'type', 'comments'].map((f) => `<option value="${f}" ${ru.field === f ? 'selected' : ''}>${{ seller: 'Seller order ID', company: 'Company', type: 'Order type', comments: 'Comments' }[f]}</option>`).join('')}</select></td>
           <td><input type="text" data-rule="${i}" data-k="match" value="${esc(ru.match)}"></td>
           <td class="num"><input type="number" min="0" data-rule="${i}" data-k="cap" value="${ru.cap || ''}" placeholder="–"></td>
+          <td class="num"><input type="number" min="0" data-rule="${i}" data-k="perPallet" value="${ru.perPallet || ''}" placeholder="–"></td>
           <td><input type="checkbox" data-rule="${i}" data-k="decide" ${ru.decide ? 'checked' : ''}></td>
           <td><button class="btn ghost danger" data-del-rule="${i}" aria-label="Remove rule">Remove</button></td></tr>`).join('')}
         </tbody></table></div>
@@ -354,7 +374,8 @@
       <section class="card"><h3>Transport plan</h3>
         ${txt('ourSite', 'Our trailers come from', 'Pattern for "Delivery / Collection From"')}
         ${txt('skipKinds', 'Ignore these delivery types', 'Not customer trailers, e.g. transfers')}
-        ${txt('noShopKinds', 'Don’t shop into', 'These keep their own orders but take nothing extra')}
+        ${txt('noShopKinds', 'Don\u2019t shop into', 'These keep their own orders but take nothing extra')}
+        ${txt('xdockKinds', 'X-Dock trailers', 'Delivery types run by the X-Dock department')}
         ${txt('collectionMatch', 'Customer collections', 'Matched against seller order ID and comments')}
         <label class="field"><span class="label">Transport day to use</span>
           <select data-cfg-text="templateDay"><option value="">Automatic (same date, else same weekday)</option>
@@ -378,10 +399,10 @@
   /* ----------------------------- events ----------------------------- */
   function copyShopping() {
     const r = state.result;
-    const head = ['Need by', 'Customer', 'Trailer delivery', 'Delivery type', 'Seller order', 'Order', 'Wave', 'Was due', 'Picks left', 'Total picks', 'Trailer %', 'Action'];
-    const lines = r.shopping.filter((m) => custOk(m.order.customer)).map((m) => {
-      const o = m.order, s = m.slot;
-      return [SP.fmtDayTime(s.paperwork != null ? s.paperwork : s.delivery), s.customer, SP.fmtDayTime(s.delivery), s.kind, o.seller, o.id, o.wave, SP.fmtDayTime(o.delivery), o.remaining, o.total, Math.round(o.frac * 100), action(o, s).replace(/<[^>]+>/g, '')].join('\t');
+    const head = ['Need by', 'Customer', 'Trailer delivery', 'Delivery type', 'Seller order', 'Orders', 'Wave', 'Was due', 'Picks left', 'Total picks', 'Pallets', 'Trailer %', 'Action'];
+    const lines = SP.groupShopping(r.shopping.filter((m) => custOk(m.order.customer))).map((g) => {
+      const o = g.order, s = g.slot, many = g.orders.length > 1;
+      return [SP.fmtDayTime(s.paperwork != null ? s.paperwork : s.delivery), s.customer, SP.fmtDayTime(s.delivery), s.kind, many ? `${g.orders.length} orders` : o.seller, many ? g.orders.map((x) => x.id).join(' ') : o.id, o.wave, SP.fmtDayTime(o.delivery), g.remaining, g.total, Math.round(g.pallets * 10) / 10, Math.round(g.frac * 100), action(o, s).replace(/<[^>]+>/g, '')].join('\t');
     });
     const text = [head.join('\t'), ...lines].join('\n');
     const fallback = () => {
@@ -423,7 +444,7 @@
     else if (el.id === 'customer') state.customer = el.value;
     else if (el.id === 'show-empty') state.showEmpty = el.checked;
     else if (el.id === 'show-past') state.showPast = el.checked;
-    else if (d.done) { if (el.checked) state.done[d.done] = Date.now(); else delete state.done[d.done]; saveDone(); }
+    else if (d.done) { for (const id of d.done.split(',')) { if (el.checked) state.done[id] = Date.now(); else delete state.done[id]; } saveDone(); }
     else if (d.pct) {
       const o = state.overrides[d.pct] || {};
       if (el.value === '') delete o.pct; else o.pct = Math.max(0, +el.value);
@@ -437,8 +458,8 @@
       saveCfg();
     } else if (d.cfgBool) { state.cfg[d.cfgBool] = el.checked; saveCfg(); }
     else if (d.cfgText) { state.cfg[d.cfgText] = el.value || (d.cfgText === 'templateDay' ? null : ''); saveCfg(); }
-    else if (d.area != null) { const a = state.cfg.areas[+d.area]; a[d.k] = d.k === 'cap' ? Math.max(1, +el.value || 1) : el.value; if (d.k === 'cap') a.confirm = false; saveCfg(); }
-    else if (d.rule != null) { const ru = state.cfg.rules[+d.rule]; ru[d.k] = d.k === 'decide' ? el.checked : d.k === 'cap' ? (+el.value || 0) : el.value; saveCfg(); }
+    else if (d.area != null) { const a = state.cfg.areas[+d.area]; a[d.k] = d.k === 'count' ? el.checked : d.k === 'match' ? el.value : Math.max(1, +el.value || 1); saveCfg(); }
+    else if (d.rule != null) { const ru = state.cfg.rules[+d.rule]; ru[d.k] = d.k === 'decide' ? el.checked : (d.k === 'cap' || d.k === 'perPallet') ? (+el.value || 0) : el.value; saveCfg(); }
     else if (d.cust != null) { state.cfg.customers[+d.cust][+d.k] = el.value; saveCfg(); }
     else return;
     const y = window.scrollY;

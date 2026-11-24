@@ -258,21 +258,27 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
   /* Default rules. Everything here is editable in the app's Rules tab. */
   /* ------------------------------------------------------------------ */
   const DEFAULT_CONFIG = {
-    // How many picks from each area fill one trailer. First match wins.
+    // Per picking area: picks that make one pallet, and pallets that fill a trailer.
+    // First pattern that matches the export's column name wins. count:false = not counted.
     areas: [
-      { name: 'Wide', match: '^wide', cap: 35 },
-      { name: 'VNA 1-5', match: '^vna', cap: 35 },
-      { name: 'Bulk (internal)', match: '^bulk ?int', cap: 14 },
-      { name: 'Bulk external', match: '^bulk ?ext', cap: 8 },
-      { name: 'Mothersons', match: '^m(o)?th', cap: 200, confirm: true },
-      { name: 'Mezzanine', match: '^mezz', cap: 100, confirm: true },
-      { name: 'P&D', match: '^p ?& ?d', cap: 35, confirm: true },
-      { name: 'Kits (Cabs / LP / T4)', match: 'kit$|^t4$', cap: 35, confirm: true },
+      { name: 'Wide', match: '^wide', perPallet: 1, perTrailer: 35 },
+      { name: 'VNA 1-5', match: '^vna', perPallet: 1, perTrailer: 35 },
+      { name: 'Bulk (internal)', match: '^bulk ?int', perPallet: 1, perTrailer: 14 },
+      { name: 'Bulk external', match: '^bulk ?ext', perPallet: 1, perTrailer: 8 },
+      { name: 'Mothersons (boxes)', match: '^m(o)?th', perPallet: 18, perTrailer: 35 },
+      { name: 'Mezzanine (boxes)', match: '^mezz', perPallet: 18, perTrailer: 35 },
+      { name: 'P&D (already in VNA)', match: '^p ?& ?d', perPallet: 1, perTrailer: 35, count: false },
+      { name: 'Kits', match: 'kit$|^t4$', perPallet: 64, perTrailer: 35 },
     ],
-    defaultCap: 35,
-    // Order-level rules, matched against seller order ID / company / comments.
-    // cap: picks per trailer for the whole order. decide: admin sets the fill by hand.
+    defaultPerTrailer: 35, // pallets per trailer for anything not listed
+    // Order-level rules, matched against seller order ID / company / comments / order type.
+    // First match wins. cap: pallets per trailer for the whole order (1 pick = 1 pallet).
+    // perPallet: whole orders per pallet (kits are one small box each).
+    // decide: the admin sets the trailer share by hand.
     rules: [
+      { name: 'Cabs kits', field: 'type', match: 'cabs kit', perPallet: 16 },
+      { name: 'Landpower kits', field: 'type', match: 'landpower.?kit|lp.?kit', perPallet: 16 },
+      { name: 'T4 kits', field: 'type', match: 't4', perPallet: 16 },
       { name: 'Shovels', field: 'seller', match: 'shovel', cap: 16 },
       { name: 'Skips', field: 'seller', match: 'skip', cap: 5 },
       { name: 'Landpower (decide)', field: 'company', match: 'landpower', decide: true },
@@ -284,7 +290,9 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     sameDayOnly: true, // only pull orders delivering on the same day as the trailer
     leadMinutes: 60, // stop shopping into a trailer this long before its paperwork time
     protectSources: true, // don't take orders off a trailer that is already full enough
-    includeKitting: false,
+    includeKitting: true,
+    xdockKinds: 'x-dock', // X-Dock department trailers: not ours, but suggested for sharing
+    useXdock: false, // true = plan our orders onto X-Dock trailers like our own
     ourSite: 'emg|maersk', // "Delivery / Collection From" values that are our trailers
     skipKinds: 'transfer|collection|emg to cover', // delivery types that are not our customer trailers
     noShopKinds: 'live tip', // delivery types that keep their own orders but take nothing extra
@@ -368,6 +376,9 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     return day * DAY + t;
   }
 
+  // A delivery at 00:00 counts as 23:59 on the day before (the site's convention).
+  const midnight = (abs) => (abs != null && abs % DAY === 0 ? abs - 1 : abs);
+
   // "13 h, 28 min left" / "1 days, 1 h, 28 min left" / "2 h, 5 min late"
   function parseLate(v) {
     const s = lc(v);
@@ -429,7 +440,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
       }
       if (!h) return;
       const id = clean(at(row, h.id));
-      const delivery = parseDateTime(at(row, h.del));
+      const delivery = midnight(parseDateTime(at(row, h.del)));
       if (delivery == null || !/^\d{3,}$/.test(id) || seen.has(id)) return;
       seen.add(id);
 
@@ -519,7 +530,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
         }
         const a = aDay * DAY + anchor;
         const fwd = (t) => (t == null ? null : a + ((t - anchor + DAY) % DAY));
-        paperwork = fwd(p); despatch = fwd(s); delivery = fwd(d);
+        paperwork = fwd(p); despatch = fwd(s); delivery = midnight(fwd(d));
       }
       const statusText = clean(at(row, h.status));
       slots.push({
@@ -538,46 +549,61 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
   }
 
   /* ----------------------------- sizing ----------------------------- */
-  function areaCap(area, cfg) {
-    for (const a of cfg.areas) if (rx(a.match).test(area)) return Math.max(0.1, +a.cap || cfg.defaultCap);
-    return cfg.defaultCap;
+  function areaRule(area, cfg) {
+    for (const a of cfg.areas) if (rx(a.match).test(area)) return a;
+    return null;
   }
 
-  // Share of one trailer this order needs (1 = a full trailer).
+  // Pallets and share of one trailer this order needs (frac 1 = a full trailer).
   function sizeOrder(o, cfg, override) {
-    const out = { frac: 0, basis: '', rule: null, decide: false, estimated: false };
+    const out = { frac: 0, pallets: 0, basis: '', rule: null, decide: false, estimated: false };
+    const per = cfg.defaultPerTrailer || 35;
     for (const r of cfg.rules) {
-      const field = r.field === 'company' ? o.company : r.field === 'comments' ? o.comments : o.seller;
-      if (!rx(r.match).test(field)) continue;
+      const field = r.field === 'company' ? o.company : r.field === 'comments' ? o.comments : r.field === 'type' ? o.type : o.seller;
+      if (!r.match || !rx(r.match).test(field)) continue;
       out.rule = r.name;
       if (r.decide) out.decide = true;
-      if (+r.cap > 0) {
+      if (+r.perPallet > 0) {
+        out.pallets = 1 / +r.perPallet;
+        out.frac = out.pallets / per;
+        out.basis = `1 order of ${r.perPallet} per pallet (${r.name})`;
+      } else if (+r.cap > 0) {
+        out.pallets = o.total;
         out.frac = o.total / +r.cap;
-        out.basis = `${o.total} picks ÷ ${r.cap} per trailer (${r.name})`;
+        out.basis = `${o.total} pallets ÷ ${r.cap} per trailer (${r.name})`;
       }
       break;
     }
     if (!out.basis) {
-      let frac = 0;
+      let frac = 0, pallets = 0, counted = 0;
       const parts = [];
       for (const [area, n] of Object.entries(o.areas)) {
-        const cap = areaCap(area, cfg);
-        frac += n / cap;
-        parts.push(`${n} ${area}/${cap}`);
+        const a = areaRule(area, cfg);
+        if (a && a.count === false) continue;
+        const pp = a ? Math.max(1, +a.perPallet || 1) : 1;
+        const pt = a ? Math.max(0.1, +a.perTrailer || per) : per;
+        pallets += n / pp;
+        frac += n / pp / pt;
+        counted += n;
+        parts.push(pp > 1 ? `${n} ${area} ÷ ${pp}/pallet` : `${n} ${area}`);
       }
       const picked = Math.max(0, o.total - o.areaSum);
       if (picked > 0) {
-        // Already-picked pallets lose their area in the export: assume the same mix.
-        const perPick = o.areaSum > 0 ? frac / o.areaSum : 1 / cfg.defaultCap;
-        frac += picked * perPick;
+        // Already-picked picks lose their area in the export: assume the same mix.
+        const fPer = counted > 0 ? frac / counted : 1 / per;
+        const pPer = counted > 0 ? pallets / counted : 1;
+        frac += picked * fPer;
+        pallets += picked * pPer;
         parts.push(`${picked} picked`);
-        if (o.areaSum === 0) out.estimated = true;
+        if (counted === 0) out.estimated = true;
       }
       out.frac = frac;
+      out.pallets = pallets;
       out.basis = parts.join(' + ');
     }
     if (override && override.pct != null && override.pct !== '') {
       out.frac = Math.max(0, +override.pct) / 100;
+      out.pallets = out.frac * per;
       out.basis = `set by hand to ${override.pct}%`;
       out.manual = true;
       out.decide = false;
@@ -598,8 +624,12 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     const forced = isoToDay(cfg.templateDay);
     if (forced != null && transport.days.some((d) => d.day === forced)) return forced;
     if (transport.days.some((d) => d.day === day)) return day;
-    const sameWd = transport.days.filter((d) => weekday(d.day) === weekday(day));
-    const pool = sameWd.length ? sameWd : transport.days;
+    // The schedule repeats every weekday; Fridays (and weekends) are their own.
+    const wd = weekday(day);
+    const normal = (d) => ['Mon', 'Tue', 'Wed', 'Thu'].includes(weekday(d.day));
+    let pool = transport.days.filter((d) => weekday(d.day) === wd);
+    if (!pool.length && ['Mon', 'Tue', 'Wed', 'Thu'].includes(wd)) pool = transport.days.filter(normal);
+    if (!pool.length) pool = transport.days;
     return pool.length ? pool[pool.length - 1].day : null;
   }
 
@@ -643,6 +673,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     const skipRx = rx(cfg.skipKinds);
     const noShopRx = cfg.noShopKinds ? rx(cfg.noShopKinds) : /$^/;
     const collRx = rx(cfg.collectionMatch);
+    const xdRx = cfg.xdockKinds ? rx(cfg.xdockKinds) : /$^/;
 
     /* orders */
     const orders = picking.orders
@@ -662,13 +693,18 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     const daySet = new Set(orders.map((o) => Math.floor(o.delivery / DAY)));
     daySet.add(Math.floor(now / DAY));
     const { slots: rawSlots, used } = slotsForDays(transport, [...daySet].sort((a, b) => a - b), cfg);
-    const slots = rawSlots
+    const candidates = rawSlots
       .map((s) => ({
         ...s,
         customer: customerOf(s.to, cfg),
         ours: !s.from || siteRx.test(s.from),
+        xdock: xdRx.test(s.kind),
       }))
-      .filter((s) => s.ours && s.customer && s.delivery != null && !skipRx.test(s.kind) && !/external|transfer/i.test(s.loadType))
+      .filter((s) => s.ours && s.customer && s.delivery != null && !skipRx.test(s.kind) && !/external|transfer/i.test(s.loadType));
+    // X-Dock trailers belong to another department: kept aside to suggest sharing.
+    const xdock = candidates.filter((s) => s.xdock && !cfg.useXdock && !s.gone && s.delivery > now);
+    const slots = candidates
+      .filter((s) => cfg.useXdock || !s.xdock)
       .map((s) => ({
         ...s,
         orders: [],
@@ -768,6 +804,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
       s.shopLoad = s.load - s.ownLoad;
       s.picksLeft = s.orders.reduce((t, o) => t + o.remaining, 0);
       s.picks = s.orders.reduce((t, o) => t + o.total, 0);
+      s.pallets = s.orders.reduce((t, o) => t + o.pallets, 0);
       s.trailersNeeded = Math.max(1, Math.ceil(s.load / cfg.maxFill - 1e-9));
       if (s.past) s.verdict = 'past';
       else if (!s.orders.length) s.verdict = 'empty';
@@ -780,15 +817,19 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
 
     /* 6. exceptions */
     const ex = [];
+    const xdockNear = (customer, abs, hours) => xdock
+      .filter((x) => x.customer === customer && Math.abs(x.delivery - abs) <= hours * 60)
+      .sort((a, b) => Math.abs(a.delivery - abs) - Math.abs(b.delivery - abs));
+    const xdText = (list) => list.length ? ` X-Dock trailer at ${list.slice(0, 2).map((x) => fmtTime(x.delivery)).join(' / ')} – ask X-Dock if it can take it.` : '';
     for (const o of orders) {
       if (o.collection) ex.push({ kind: 'collection', order: o, text: 'Customer collection – not on our trailers' });
       else if (!o.customer) ex.push({ kind: 'customer', order: o, text: `Unknown customer "${o.company}" – add it under Rules › Customers` });
-      else if (!o.slot) ex.push({ kind: 'noslot', order: o, text: `No ${o.customer} trailer in the transport plan for ${fmtDay(o.delivery)}` });
+      else if (!o.slot) ex.push({ kind: 'noslot', order: o, text: `No ${o.customer} trailer in the transport plan for ${fmtDay(o.delivery)}.${xdText(xdockNear(o.customer, o.delivery, 3))}` });
       else if (o.moveType === 'noslot') ex.push({ kind: 'noslot', order: o, text: `${o.note} – planned on ${fmtTime(slotById.get(o.slot).delivery)}` });
       if (o.note && /Missed/.test(o.note)) ex.push({ kind: 'missed', order: o, text: o.note });
       if (o.decide) ex.push({ kind: 'decide', order: o, text: `${o.rule}: set how much of a trailer this takes` });
       if (o.frac > cfg.maxFill + 1e-9) ex.push({ kind: 'big', order: o, text: `Order alone needs ${Math.ceil(o.frac / cfg.maxFill)} trailers` });
-      if (o.estimated) ex.push({ kind: 'estimate', order: o, text: 'Fully picked – area unknown, sized as Wide' });
+      if (o.estimated) ex.push({ kind: 'estimate', order: o, text: 'Fully picked – area unknown, sized as 1 pick = 1 pallet' });
     }
     for (const s of slots) {
       if (s.verdict === 'over') {
@@ -796,13 +837,31 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
         const hint = spare.length ? ` Unused earlier slot: ${spare.map((x) => fmtTime(x.delivery) + ' ' + x.kind).join(', ')}.` : '';
         ex.push({ kind: 'over', slot: s, text: `Over capacity: ${Math.round(s.load * 100)}% – needs ${s.trailersNeeded} trailers.${hint}` });
       }
+      if ((s.verdict === 'under' || s.verdict === 'low') && !s.past) {
+        const near = xdockNear(s.customer, s.delivery, 2);
+        if (near.length) ex.push({ kind: 'xdock', slot: s, text: `${Math.round(s.load * 100)}% full.${xdText(near)}` });
+      }
       if (s.verdict === 'empty' && s.lostAll) ex.push({ kind: 'free', slot: s, text: 'All orders moved to an earlier trailer – check with transport if this trailer is still needed' });
     }
     const usedAreaCaps = new Set();
     for (const o of orders) for (const a of Object.keys(o.areas)) {
-      const rule = cfg.areas.find((r) => rx(r.match).test(a));
+      const rule = areaRule(a, cfg);
       if (rule && rule.confirm) usedAreaCaps.add(rule.name);
     }
+
+    // Many orders with the same problem (e.g. 40 cabs kits on one wave) become one line.
+    const merged = [];
+    const byKey = new Map();
+    for (const e of ex) {
+      if (!e.order) { merged.push(e); continue; }
+      const key = [e.kind, e.order.customer, e.order.delivery, e.text].join('|');
+      if (byKey.has(key)) { byKey.get(key).orders.push(e.order); continue; }
+      const item = { ...e, orders: [e.order] };
+      byKey.set(key, item);
+      merged.push(item);
+    }
+    ex.length = 0;
+    ex.push(...merged);
 
     const upcoming = slots.filter((s) => !s.past);
     const shopping = moves
@@ -812,7 +871,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
       .sort((a, b) => (a.slot.paperwork || a.slot.delivery) - (b.slot.paperwork || b.slot.delivery));
 
     return {
-      now, cfg, orders, slots, used, moves, shopping, exceptions: ex,
+      now, cfg, orders, slots, xdock, used, moves, shopping, exceptions: ex,
       unconfirmedAreas: [...usedAreaCaps],
       summary: {
         orders: orders.length,
@@ -822,11 +881,30 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
         moves: shopping.length,
         freed: upcoming.filter((s) => s.lostAll).length,
         empty: upcoming.filter((s) => s.verdict === 'empty').length,
-        noSlot: ex.filter((e) => e.kind === 'noslot').length,
+        noSlot: ex.filter((e) => e.kind === 'noslot').reduce((t, e) => t + e.orders.length, 0),
         decide: ex.filter((e) => e.kind === 'decide').length,
         over: upcoming.filter((s) => s.verdict === 'over').length,
       },
     };
+  }
+
+  // Shopping lines for the same wave going to the same trailer are picked together.
+  function groupShopping(shopping) {
+    const groups = [];
+    const byKey = new Map();
+    for (const m of shopping) {
+      const key = [m.order.wave || m.order.id, m.to, m.type, m.order.delivery].join('|');
+      if (byKey.has(key)) {
+        const g = byKey.get(key);
+        g.orders.push(m.order);
+        g.frac += m.order.frac; g.pallets += m.order.pallets; g.remaining += m.order.remaining; g.total += m.order.total;
+        continue;
+      }
+      const g = { ...m, orders: [m.order], frac: m.order.frac, pallets: m.order.pallets, remaining: m.order.remaining, total: m.order.total };
+      byKey.set(key, g);
+      groups.push(g);
+    }
+    return groups;
   }
 
   /* ---------------------------- formatting -------------------------- */
@@ -858,7 +936,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
   }
 
   return {
-    DAY, DEFAULT_CONFIG, parsePicking, parseTransport, plan, sizeOrder, customerOf, detect,
+    DAY, DEFAULT_CONFIG, parsePicking, parseTransport, plan, sizeOrder, customerOf, detect, groupShopping,
     fmtTime, fmtDay, fmtDayTime, absToLocalInput, localInputToAbs, dayToISO, isoToDay, weekday,
     _internal: { parseDay, parseTime, parseDateTime, parseLate, chooseTemplateDay },
   };
@@ -892,7 +970,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     ['06:00', '0000501102', '0000220102', 'BHL-PRIO-BAY12-231126', 'Backhoe Loaders', 'Allocated', 'Not Released', '', 9, 9, { Wide: 6, VNA4: 3 }],
     ['06:00', '0000501103', '0000220103', 'LDL-ENG-241126-01', 'Loadall', 'Allocated', 'Not Released', '', 5, 5, { Wide: 3, 'Mthr sons': 2 }],
     ['06:00', '0000501104', '0000220104', 'LDL-QA-241126-SEE NOTES', 'Loadall', 'Allocated', 'Not Released', 'Label parts NOT FOR PRODUCTION', 4, 4, { 'Mthr sons': 4 }],
-    ['07:00', '0000501105', '0000220105', 'PS-241126-7AM', 'Power Systems', 'Allocated', 'Not Released', '', 12, 12, { Wide: 6, VNA2: 3, VNA5: 3 }],
+    ['07:00', '0000501105', '0000220105', 'PS-241126-7AM', 'Power Systems', 'Allocated', 'Not Released', '', 12, 12, { Wide: 6, VNA2: 3, VNA5: 3, 'P&D': 2 }],
     ['07:00', '0000501106', '0000220106', 'HP-241126-01', 'Heavy Products', 'Allocated', 'Not Released', '', 14, 14, { Wide: 1, 'Mthr sons': 10, VNA2: 1, BULKINT: 2 }],
     ['07:30', '0000501107', '0000220107', 'CP SO 241126-1', 'Compact Products', 'In Progress', 'Released', '', 2, 1, { 'Mthr sons': 1 }],
     ['07:30', '0000501108', '0000220108', 'CP SO 241126-3', 'Compact Products', 'Allocated', 'Released', '', 2, 2, { VNA4: 2 }],
@@ -913,6 +991,12 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     ['18:00', '0000501123', '0000220123', 'CP SO 241126-2', 'Compact Products', 'Allocated', 'Not Released', '', 1, 1, { VNA4: 1 }],
   ];
 
+  // Kitting: [time, orderId, wave, seller ref, order type, company, picks, area]
+  const KITS = [];
+  for (let i = 0; i < 12; i++) KITS.push(['20:00', String(501200 + i).padStart(10, '0'), '0000220200', `C-1545${String(300 + i)}-26-11-24`, '2 - Cabs Kit', 'Cabs Uttoxeter', 3 + (i % 2), 'CABSKIT']);
+  KITS.push(['18:00', '0000501220', '0000220220', 'F-DEC160009-02-1810', '8 - LandPower-KIT', 'Landpower Returns', 4, 'LPKIT']);
+  KITS.push(['18:00', '0000501221', '0000220220', 'F-DEC160008-04-1810', '8 - LandPower-KIT', 'Landpower Returns', 4, 'LPKIT']);
+
   function picking() {
     const head = ['Delivery Date', 'Order ID', 'Wave ID', null, 'Seller Order ID', null, 'Order Type', 'Company', null, 'Status', 'Task Release', 'Comments', 'LATE', 'Total Picks', 'Rmn. Picks', 'Picked%', ...AREAS];
     const rows = [
@@ -929,6 +1013,12 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
       tot += total; rem += remaining;
     }
     rows.push([null, 'Total Orders:', ORDERS.length, null, null, null, null, null, null, null, null, null, null, tot, rem]);
+    rows.push(['Kitting Orders'], ['DelDate: 24/11/2026'], head);
+    for (const [tm, id, wave, seller, type, company, picks, area] of KITS) {
+      const [hh, mm] = tm.split(':').map(Number);
+      rows.push([`24/11/2026 ${tm}`, id, wave, null, seller, null, type, company, null, 'Allocated', 'Released', '', late(24, hh, mm), picks, picks, '0 %', ...AREAS.map((a) => (a === area ? picks : null))]);
+    }
+    rows.push([null, 'Total Orders:', KITS.length]);
     return rows;
   }
 
@@ -942,6 +1032,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     ['05:00', '06:20', '07:00', 'Power Systems', 'OTM', ''],
     ['05:30', '06:15', '07:30', 'Compact', 'MH SO Orders', ''],
     ['06:00', '06:40', '08:00', 'Rayne', 'OTM', ''],
+    ['07:00', '08:10', '09:00', 'Heavy', 'X-Dock', ''],
     ['08:00', '09:20', '10:00', 'Power Systems', 'Raw Blocks & Heads', ''],
     ['09:00', '09:45', '11:00', 'Earthmovers', 'TIGER', ''],
     ['09:00', '10:00', '11:00', 'Loadall', 'Kingspan', ''],
@@ -955,6 +1046,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     ['16:00', '16:45', '18:00', 'Landpower', 'ACO & Kits', ''],
     ['16:00', '16:45', '18:00', 'Compact', 'MH SO Orders', ''],
     ['16:00', '17:00', '18:00', 'Loadall', 'ACO', ''],
+    ['16:00', '17:10', '18:00', 'Cabs', 'ACO + Kits', ''],
     ['20:00', '21:10', '22:00', 'ATL Site', 'Transfers', ''],
     ['22:00', '23:10', '00:00', 'Cabs', 'OTM', ''],
   ];
@@ -1000,14 +1092,14 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
   const state = {
     picking: null, pickingName: '', pickingSample: true,
     transport: null, transportName: '', transportSample: true,
-    cfg: Object.assign(clone(SP.DEFAULT_CONFIG), store.get('sp.cfg.v1', {})),
+    cfg: Object.assign(clone(SP.DEFAULT_CONFIG), store.get('sp.cfg.v2', {})),
     overrides: store.get('sp.overrides.v1', {}),
     done: store.get('sp.done.v1', {}),
     now: null, nowFromFile: true,
     tab: 'shopping', customer: '', showEmpty: false, showPast: false,
     message: null, result: null,
   };
-  const saveCfg = () => store.set('sp.cfg.v1', state.cfg);
+  const saveCfg = () => store.set('sp.cfg.v2', state.cfg);
   const saveOverrides = () => store.set('sp.overrides.v1', state.overrides);
   const saveDone = () => store.set('sp.done.v1', state.done);
 
@@ -1022,7 +1114,8 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
 
   /* ---------------------------- helpers ----------------------------- */
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-  const pct = (f) => `${Math.round(f * 100)}%`;
+  const pct = (f) => (f > 0 && f < 0.005 ? '<1%' : `${Math.round(f * 100)}%`);
+  const pal = (n) => (n >= 10 ? Math.round(n) : n >= 1 ? n.toFixed(1).replace(/\.0$/, '') : n > 0 ? '<1' : '0');
   const t = SP.fmtTime;
   function when(abs, refDay) {
     if (abs == null) return '–';
@@ -1129,7 +1222,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
           <span class="small muted">${tr.slots.length} rows · trailers for ${esc(used || 'no matching day')}</span>
         </div>
       </section>
-      ${r.used.some((u) => !u.exact) ? `<div class="banner warn">The transport plan has no sheet for ${r.used.filter((u) => !u.exact).map((u) => SP.fmtDay(u.day * DAY)).join(', ')}, so trailer times come from the same weekday in the file. Load today's transport plan to use the real trailers and wave numbers.</div>` : ''}
+      ${r.used.some((u) => !u.exact) ? `<div class="banner warn">No sheet in the transport plan for ${r.used.filter((u) => !u.exact).map((u) => `${SP.fmtDay(u.day * DAY)} (using ${SP.fmtDay(u.source * DAY)})`).join(', ')}. The schedule repeats every day except Friday, so trailer times are taken from another day. Load today's plan to also match the wave numbers written on it.</div>` : ''}
       ${r.unconfirmedAreas.length ? `<div class="banner warn">Trailer capacity for ${r.unconfirmedAreas.map(esc).join(', ')} is a guess. Check it under Rules.</div>` : ''}
     `;
   }
@@ -1150,10 +1243,11 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
 
   function viewKpis(r) {
     const s = r.summary;
+    const lines = SP.groupShopping(r.shopping).length;
     const decide = r.exceptions.filter((e) => ['decide', 'over', 'big', 'noslot', 'missed', 'customer'].includes(e.kind)).length;
     return `
       <section class="kpis">
-        <div class="kpi attn"><span class="label">Orders to pick early</span><span class="v">${s.moves}</span><span class="small muted">to fill trailers that leave sooner</span></div>
+        <div class="kpi attn"><span class="label">Lines to pick early</span><span class="v">${lines}</span><span class="small muted">${s.moves} order${s.moves === 1 ? '' : 's'}, to fill trailers that leave sooner</span></div>
         <div class="kpi ${s.under ? 'warn' : ''}"><span class="label">Trailers under ${pct(r.cfg.targetFill)}</span><span class="v">${s.under} <small>was ${s.underBefore}</small></span><span class="small muted">of ${s.trailers - s.empty} running</span></div>
         <div class="kpi attn"><span class="label">Trailers maybe not needed</span><span class="v">${s.freed}</span><span class="small muted">all their orders go earlier</span></div>
         <div class="kpi ${decide ? 'bad' : ''}"><span class="label">Need a decision</span><span class="v">${decide}</span><span class="small muted">see Exceptions</span></div>
@@ -1162,7 +1256,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
 
   function viewTabs(r) {
     const ex = r.exceptions.filter((e) => e.kind !== 'collection' && e.kind !== 'estimate').length;
-    const tabs = [['shopping', 'Shopping list', r.shopping.length], ['trailers', 'Trailers', null], ['exceptions', 'Exceptions', ex], ['orders', 'Orders', r.orders.length], ['rules', 'Rules', null]];
+    const tabs = [['shopping', 'Shopping list', SP.groupShopping(r.shopping).length], ['trailers', 'Trailers', null], ['exceptions', 'Exceptions', ex], ['orders', 'Orders', r.orders.length], ['rules', 'Rules', null]];
     return `<nav class="tabs" role="tablist">${tabs.map(([k, label, n]) => `<button class="tab" role="tab" data-tab="${k}" aria-selected="${state.tab === k}">${label}${n != null ? `<span class="count">${n}</span>` : ''}</button>`).join('')}</nav>`;
   }
 
@@ -1170,34 +1264,39 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
   const planDay = () => Math.floor(state.now / DAY) + (state.now % DAY >= 12 * 60 ? 1 : 0);
 
   function viewShopping(r) {
-    const rows = r.shopping.filter((m) => custOk(m.order.customer));
+    const rows = SP.groupShopping(r.shopping.filter((m) => custOk(m.order.customer)));
     if (!rows.length) return `<div class="empty-state">Nothing to shop. Every running trailer is full enough, or nothing later can go on it.</div>`;
     const ref = planDay();
     let lastKey = null;
-    const body = rows.map((m) => {
-      const o = m.order, s = m.slot;
+    const body = rows.map((g) => {
+      const o = g.order, s = g.slot, many = g.orders.length > 1;
       const key = s.paperwork != null ? s.paperwork : s.delivery;
       let group = '';
       if (key !== lastKey) {
         lastKey = key;
-        group = `<tr class="group"><td colspan="8">Paperwork by ${when(key, ref)} – ${esc(s.customer)} ${t(s.delivery)} trailer, now ${pct(s.load)} full</td></tr>`;
+        group = `<tr class="group"><td colspan="8">Paperwork by ${when(key, ref)} – ${esc(s.customer)} ${t(s.delivery)} trailer, now ${pct(s.load)} full (≈ ${pal(s.pallets)} pallets)</td></tr>`;
       }
-      const [mLabel, mClass] = MOVE[m.type] || ['Moved', ''];
-      const done = !!state.done[o.id];
+      const [mLabel, mClass] = MOVE[g.type] || ['Moved', ''];
+      const ids = g.orders.map((x) => x.id);
+      const done = ids.every((id) => state.done[id]);
+      const areas = many ? '' : areaChips(o);
+      const name = many
+        ? `<span class="ref">${g.orders.length} ${esc(o.type.replace(/^\d+\s*-\s*/, '') || 'orders')} orders</span><div class="small muted mono">Wave ${esc(o.wave)} · ${esc(g.orders[0].seller)} … ${esc(g.orders[g.orders.length - 1].seller)}</div>`
+        : `<span class="ref">${esc(o.seller || o.id)}</span><div class="small muted mono">Order ${esc(o.id.replace(/^0+/, ''))} · Wave ${esc(o.wave)}</div>`;
       return `${group}<tr class="${done ? 'done' : ''}">
-        <td><input type="checkbox" data-done="${esc(o.id)}" ${done ? 'checked' : ''} aria-label="Mark ${esc(o.seller)} as sent to picking"></td>
+        <td><input type="checkbox" data-done="${esc(ids.join(','))}" ${done ? 'checked' : ''} aria-label="Mark as sent to picking"></td>
         <td><span class="t">${when(key, ref)}</span><div class="small muted">paperwork</div></td>
         <td><strong>${esc(s.customer)} ${t(s.delivery)}</strong><div class="small muted">${esc(s.kind)}${s.despatch != null ? ` · desp ${t(s.despatch)}` : ''}</div></td>
-        <td><span class="ref">${esc(o.seller || o.id)}</span><div class="small muted mono">Order ${esc(o.id.replace(/^0+/, ''))} · Wave ${esc(o.wave)}</div></td>
+        <td>${name}</td>
         <td><span class="mono">${when(o.delivery, ref)}</span><div><span class="chip ${mClass}">${mLabel}</span></div></td>
-        <td><span class="mono">${o.remaining} / ${o.total}</span>${areaChips(o)}</td>
-        <td class="num mono">+${pct(o.frac)}</td>
+        <td><span class="mono">${g.remaining} / ${g.total}</span>${areas}</td>
+        <td class="num mono">+${pct(g.frac)}<div class="small muted">≈ ${pal(g.pallets)} pal</div></td>
         <td class="action">${action(o, s)}</td>
       </tr>`;
     }).join('');
     return `
       <div class="panel-head">
-        <p class="muted small">Ordered by when the trailer's paperwork is due. Tick an order once picking have it.</p>
+        <p class="muted small">Ordered by when the trailer's paperwork is due. Orders on the same wave are one line. Tick a line once picking have it.</p>
         <button class="btn" data-act="copy">Copy for Excel / Teams</button>
       </div>
       <div class="table-box"><table>
@@ -1210,16 +1309,25 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     const own = Math.min(s.ownLoad, 1), shop = Math.min(Math.max(0, s.load - s.ownLoad), Math.max(0, 1 - own));
     const verdict = s.lostAll ? 'Maybe not needed' : VERDICT[s.verdict];
     const vclass = s.lostAll ? 'info' : VCLASS[s.verdict];
-    const lis = s.orders.slice().sort((a, b) => a.delivery - b.delivery).map((o) => {
+    const lines = [];
+    const byWave = new Map();
+    for (const o of s.orders.slice().sort((a, b) => a.delivery - b.delivery)) {
+      const k = o.rule && /kit/i.test(o.rule) ? `${o.wave}|${!!o.moveType}|${o.delivery}` : o.id;
+      if (byWave.has(k)) { const l = byWave.get(k); l.n++; l.frac += o.frac; l.rem += o.remaining; l.tot += o.total; continue; }
+      const l = { o, n: 1, frac: o.frac, rem: o.remaining, tot: o.total };
+      byWave.set(k, l); lines.push(l);
+    }
+    const lis = lines.map(({ o, n, frac, rem, tot }) => {
       const moved = o.moveType ? ` <span class="muted">(due ${when(o.delivery, ref)})</span>` : '';
-      return `<li class="${o.moveType ? 'in' : ''}"><span class="who">${esc(o.seller || o.id)}${moved}</span><span class="pct">${o.remaining}/${o.total} · ${pct(o.frac)}</span></li>`;
+      const who = n > 1 ? `${n} kit orders, wave ${esc(o.wave)}` : esc(o.seller || o.id);
+      return `<li class="${o.moveType ? 'in' : ''}"><span class="who">${who}${moved}</span><span class="pct">${rem}/${tot} · ${pct(frac)}</span></li>`;
     }).join('');
     const gone = r.moves.filter((m) => m.from === s.id && m.order.slot !== s.id);
     const goneTxt = gone.length ? `<p class="small muted">${gone.length} order${gone.length > 1 ? 's' : ''} moved to earlier trailers.</p>` : '';
     return `<article class="trailer v-${s.verdict} ${s.lostAll ? 'freed' : ''}">
       <header><span class="t">${when(s.delivery, ref)}</span><span class="kind">${esc(s.kind || 'Trailer')}</span><span class="chip ${vclass}">${verdict}</span></header>
       <div class="fill-row"><div class="bar ${s.load > r.cfg.maxFill ? 'over' : ''}" title="Solid: own orders · striped: shopped in"><span class="own" style="width:${own * 100}%"></span><span class="shop" style="width:${shop * 100}%"></span><i class="target" style="left:${target * 100}%"></i></div><span class="pct">${pct(s.load)}</span></div>
-      <dl><div><dt>Paperwork</dt><dd>${t(s.paperwork)}</dd></div><div><dt>Despatch</dt><dd>${t(s.despatch)}</dd></div><div><dt>Picks left</dt><dd>${s.picksLeft}</dd></div>${s.trailer ? `<div><dt>Trailer</dt><dd>${esc(s.trailer)}</dd></div>` : ''}</dl>
+      <dl><div><dt>Paperwork</dt><dd>${t(s.paperwork)}</dd></div><div><dt>Despatch</dt><dd>${t(s.despatch)}</dd></div><div><dt>Pallets</dt><dd>≈ ${pal(s.pallets)}</dd></div><div><dt>Picks left</dt><dd>${s.picksLeft}</dd></div>${s.trailer ? `<div><dt>Trailer</dt><dd>${esc(s.trailer)}</dd></div>` : ''}</dl>
       ${lis ? `<ul>${lis}</ul>` : ''}${goneTxt}
     </article>`;
   }
@@ -1246,6 +1354,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     ['big', 'Orders bigger than one trailer', ''],
     ['noslot', 'No trailer at the due time', 'The transport plan has no trailer for this customer at this time.'],
     ['missed', 'Missed trailers', 'The trailer has gone but picks are still open.'],
+    ['xdock', 'Could share with X-Dock', 'Our trailer is under target and an X-Dock trailer goes to the same customer around the same time.'],
     ['free', 'Trailers maybe not needed', 'All orders moved to earlier trailers. Check with transport before cancelling.'],
     ['customer', 'Unknown customers', 'Add a pattern for them under Rules › Customers.'],
     ['collection', 'Customer collections', 'Not planned on our trailers.'],
@@ -1258,7 +1367,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
       if (!items.length) return '';
       return `<section class="ex-group"><h3>${title} <span class="muted small">${items.length}</span></h3>${help ? `<p class="muted small">${help}</p>` : ''}
         <ul class="ex-list">${items.map((e) => e.order
-          ? `<li><span class="what">${esc(e.order.seller || e.order.id)}</span><span class="muted small mono">${esc(e.order.customer || e.order.company)} · due ${when(e.order.delivery, ref)} · order ${esc(e.order.id.replace(/^0+/, ''))}</span><span>${esc(e.text)}</span></li>`
+          ? `<li><span class="what">${e.orders.length > 1 ? `${e.orders.length} orders on wave ${esc(e.order.wave)}` : esc(e.order.seller || e.order.id)}</span><span class="muted small mono">${esc(e.order.customer || e.order.company)} · due ${when(e.order.delivery, ref)}${e.orders.length > 1 ? '' : ` · order ${esc(e.order.id.replace(/^0+/, ''))}`}</span><span>${esc(e.text)}</span></li>`
           : `<li><span class="what">${esc(e.slot.customer)} ${when(e.slot.delivery, ref)} ${esc(e.slot.kind)}</span><span>${esc(e.text)}</span></li>`).join('')}</ul></section>`;
     }).join('');
     return parts || `<div class="empty-state">No exceptions.</div>`;
@@ -1270,7 +1379,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     const rows = r.orders.filter((o) => custOk(o.customer)).sort((a, b) => a.delivery - b.delivery || (a.customer || '').localeCompare(b.customer || ''));
     return `<p class="muted small">Set a trailer share by hand (for example Landpower engines that can't be stacked, or rubber-track machines). Tick "Keep" to stop an order being moved.</p>
       <div class="table-box"><table>
-      <thead><tr><th>Due</th><th>Customer</th><th>Order</th><th>Status</th><th>Picks left</th><th class="num">Trailer share</th><th>Set %</th><th>Keep</th><th>Planned on</th></tr></thead>
+      <thead><tr><th>Due</th><th>Customer</th><th>Order</th><th>Status</th><th>Picks left</th><th class="num">Pallets</th><th class="num">Trailer share</th><th>Set %</th><th>Keep</th><th>Planned on</th></tr></thead>
       <tbody>${rows.map((o) => {
         const s = o.slot && slotById.get(o.slot);
         const ov = state.overrides[o.id] || {};
@@ -1281,6 +1390,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
           <td><span class="ref">${esc(o.seller || o.id)}</span><div class="small muted mono">Order ${esc(o.id.replace(/^0+/, ''))} · Wave ${esc(o.wave)}</div>${o.comments ? `<div class="small">${esc(o.comments)}</div>` : ''}</td>
           <td class="small">${esc(o.status)}<div class="muted">${esc(o.release)}</div></td>
           <td><span class="mono">${o.remaining} / ${o.total}</span>${areaChips(o)}</td>
+          <td class="num mono">${pal(o.pallets)}</td>
           <td class="num mono" title="${esc(o.basis)}">${pct(o.frac)}</td>
           <td><input type="number" min="0" max="400" step="5" data-pct="${esc(o.id)}" value="${ov.pct != null ? esc(ov.pct) : ''}" placeholder="auto" aria-label="Trailer share for ${esc(o.seller)}"></td>
           <td><input type="checkbox" data-lock="${esc(o.id)}" ${ov.lock ? 'checked' : ''} aria-label="Keep ${esc(o.seller)} on its own trailer"></td>
@@ -1307,21 +1417,23 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
         ${chk('sameDayOnly', 'Only pull orders delivering the same day')}
         ${chk('protectSources', "Don't take orders off trailers that are already full enough")}
         ${chk('includeKitting', 'Include kitting orders (Cabs kits, Landpower kits, T4)')}
+        ${chk('useXdock', 'Plan our orders onto X-Dock trailers as if they were ours')}
       </section>
-      <section class="card"><h3>Picks per trailer by area</h3>
-        <p>How many picks from one area fill a trailer on their own. A mixed order adds up its share from each area. Patterns are matched against the area column names in the export.</p>
-        <div class="table-box"><table><thead><tr><th>Area</th><th>Column pattern</th><th class="num">Picks / trailer</th></tr></thead><tbody>
-        ${c.areas.map((a, i) => `<tr><td>${esc(a.name)}${a.confirm ? ' <span class="chip under">Guess</span>' : ''}</td><td><input type="text" data-area="${i}" data-k="match" value="${esc(a.match)}"></td><td class="num"><input type="number" min="1" data-area="${i}" data-k="cap" value="${a.cap}"></td></tr>`).join('')}
+      <section class="card"><h3>Pallets by picking area</h3>
+        <p>1 pick is 1 pallet, except box areas. A mixed order adds up its share of a trailer from each area. Untick "Count" for columns that repeat picks counted elsewhere (P&D is already in VNA).</p>
+        <div class="table-box"><table><thead><tr><th>Area</th><th>Column pattern</th><th class="num">Picks / pallet</th><th class="num">Pallets / trailer</th><th>Count</th></tr></thead><tbody>
+        ${c.areas.map((a, i) => `<tr><td>${esc(a.name)}</td><td><input type="text" data-area="${i}" data-k="match" value="${esc(a.match)}"></td><td class="num"><input type="number" min="1" data-area="${i}" data-k="perPallet" value="${a.perPallet}"></td><td class="num"><input type="number" min="1" data-area="${i}" data-k="perTrailer" value="${a.perTrailer}"></td><td><input type="checkbox" data-area="${i}" data-k="count" ${a.count === false ? '' : 'checked'} aria-label="Count ${esc(a.name)}"></td></tr>`).join('')}
         </tbody></table></div>
-        ${numField('defaultCap', 'Any other area', c.defaultCap, 1)}
+        ${numField('defaultPerTrailer', 'Pallets per trailer, any other area', c.defaultPerTrailer, 1)}
       </section>
       <section class="card"><h3>Order rules</h3>
-        <p>Rules for orders that don't follow the area numbers. The first rule that matches wins. "Decide" asks the admin to set the trailer share by hand.</p>
-        <div class="table-box"><table><thead><tr><th>Name</th><th>Look in</th><th>Contains</th><th class="num">Picks / trailer</th><th>Decide</th><th></th></tr></thead><tbody>
+        <p>For orders that don't follow the area numbers. The first rule that matches wins. Use "Pallets / trailer" for big items (16 shovels fill a trailer), or "Orders / pallet" for kits (16 small boxes on a pallet). "Decide" asks the admin to set the share by hand.</p>
+        <div class="table-box"><table><thead><tr><th>Name</th><th>Look in</th><th>Contains</th><th class="num">Pallets / trailer</th><th class="num">Orders / pallet</th><th>Decide</th><th></th></tr></thead><tbody>
         ${c.rules.map((ru, i) => `<tr><td><input type="text" data-rule="${i}" data-k="name" value="${esc(ru.name)}"></td>
-          <td><select data-rule="${i}" data-k="field">${['seller', 'company', 'comments'].map((f) => `<option value="${f}" ${ru.field === f ? 'selected' : ''}>${{ seller: 'Seller order ID', company: 'Company', comments: 'Comments' }[f]}</option>`).join('')}</select></td>
+          <td><select data-rule="${i}" data-k="field">${['seller', 'company', 'type', 'comments'].map((f) => `<option value="${f}" ${ru.field === f ? 'selected' : ''}>${{ seller: 'Seller order ID', company: 'Company', type: 'Order type', comments: 'Comments' }[f]}</option>`).join('')}</select></td>
           <td><input type="text" data-rule="${i}" data-k="match" value="${esc(ru.match)}"></td>
           <td class="num"><input type="number" min="0" data-rule="${i}" data-k="cap" value="${ru.cap || ''}" placeholder="–"></td>
+          <td class="num"><input type="number" min="0" data-rule="${i}" data-k="perPallet" value="${ru.perPallet || ''}" placeholder="–"></td>
           <td><input type="checkbox" data-rule="${i}" data-k="decide" ${ru.decide ? 'checked' : ''}></td>
           <td><button class="btn ghost danger" data-del-rule="${i}" aria-label="Remove rule">Remove</button></td></tr>`).join('')}
         </tbody></table></div>
@@ -1337,7 +1449,8 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
       <section class="card"><h3>Transport plan</h3>
         ${txt('ourSite', 'Our trailers come from', 'Pattern for "Delivery / Collection From"')}
         ${txt('skipKinds', 'Ignore these delivery types', 'Not customer trailers, e.g. transfers')}
-        ${txt('noShopKinds', 'Don’t shop into', 'These keep their own orders but take nothing extra')}
+        ${txt('noShopKinds', 'Don\u2019t shop into', 'These keep their own orders but take nothing extra')}
+        ${txt('xdockKinds', 'X-Dock trailers', 'Delivery types run by the X-Dock department')}
         ${txt('collectionMatch', 'Customer collections', 'Matched against seller order ID and comments')}
         <label class="field"><span class="label">Transport day to use</span>
           <select data-cfg-text="templateDay"><option value="">Automatic (same date, else same weekday)</option>
@@ -1361,10 +1474,10 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
   /* ----------------------------- events ----------------------------- */
   function copyShopping() {
     const r = state.result;
-    const head = ['Need by', 'Customer', 'Trailer delivery', 'Delivery type', 'Seller order', 'Order', 'Wave', 'Was due', 'Picks left', 'Total picks', 'Trailer %', 'Action'];
-    const lines = r.shopping.filter((m) => custOk(m.order.customer)).map((m) => {
-      const o = m.order, s = m.slot;
-      return [SP.fmtDayTime(s.paperwork != null ? s.paperwork : s.delivery), s.customer, SP.fmtDayTime(s.delivery), s.kind, o.seller, o.id, o.wave, SP.fmtDayTime(o.delivery), o.remaining, o.total, Math.round(o.frac * 100), action(o, s).replace(/<[^>]+>/g, '')].join('\t');
+    const head = ['Need by', 'Customer', 'Trailer delivery', 'Delivery type', 'Seller order', 'Orders', 'Wave', 'Was due', 'Picks left', 'Total picks', 'Pallets', 'Trailer %', 'Action'];
+    const lines = SP.groupShopping(r.shopping.filter((m) => custOk(m.order.customer))).map((g) => {
+      const o = g.order, s = g.slot, many = g.orders.length > 1;
+      return [SP.fmtDayTime(s.paperwork != null ? s.paperwork : s.delivery), s.customer, SP.fmtDayTime(s.delivery), s.kind, many ? `${g.orders.length} orders` : o.seller, many ? g.orders.map((x) => x.id).join(' ') : o.id, o.wave, SP.fmtDayTime(o.delivery), g.remaining, g.total, Math.round(g.pallets * 10) / 10, Math.round(g.frac * 100), action(o, s).replace(/<[^>]+>/g, '')].join('\t');
     });
     const text = [head.join('\t'), ...lines].join('\n');
     const fallback = () => {
@@ -1406,7 +1519,7 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
     else if (el.id === 'customer') state.customer = el.value;
     else if (el.id === 'show-empty') state.showEmpty = el.checked;
     else if (el.id === 'show-past') state.showPast = el.checked;
-    else if (d.done) { if (el.checked) state.done[d.done] = Date.now(); else delete state.done[d.done]; saveDone(); }
+    else if (d.done) { for (const id of d.done.split(',')) { if (el.checked) state.done[id] = Date.now(); else delete state.done[id]; } saveDone(); }
     else if (d.pct) {
       const o = state.overrides[d.pct] || {};
       if (el.value === '') delete o.pct; else o.pct = Math.max(0, +el.value);
@@ -1420,8 +1533,8 @@ textarea.copy-fallback { width: 100%; height: 160px; font-family: var(--font-mon
       saveCfg();
     } else if (d.cfgBool) { state.cfg[d.cfgBool] = el.checked; saveCfg(); }
     else if (d.cfgText) { state.cfg[d.cfgText] = el.value || (d.cfgText === 'templateDay' ? null : ''); saveCfg(); }
-    else if (d.area != null) { const a = state.cfg.areas[+d.area]; a[d.k] = d.k === 'cap' ? Math.max(1, +el.value || 1) : el.value; if (d.k === 'cap') a.confirm = false; saveCfg(); }
-    else if (d.rule != null) { const ru = state.cfg.rules[+d.rule]; ru[d.k] = d.k === 'decide' ? el.checked : d.k === 'cap' ? (+el.value || 0) : el.value; saveCfg(); }
+    else if (d.area != null) { const a = state.cfg.areas[+d.area]; a[d.k] = d.k === 'count' ? el.checked : d.k === 'match' ? el.value : Math.max(1, +el.value || 1); saveCfg(); }
+    else if (d.rule != null) { const ru = state.cfg.rules[+d.rule]; ru[d.k] = d.k === 'decide' ? el.checked : (d.k === 'cap' || d.k === 'perPallet') ? (+el.value || 0) : el.value; saveCfg(); }
     else if (d.cust != null) { state.cfg.customers[+d.cust][+d.k] = el.value; saveCfg(); }
     else return;
     const y = window.scrollY;

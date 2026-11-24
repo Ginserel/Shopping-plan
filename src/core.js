@@ -22,21 +22,27 @@
   /* Default rules. Everything here is editable in the app's Rules tab. */
   /* ------------------------------------------------------------------ */
   const DEFAULT_CONFIG = {
-    // How many picks from each area fill one trailer. First match wins.
+    // Per picking area: picks that make one pallet, and pallets that fill a trailer.
+    // First pattern that matches the export's column name wins. count:false = not counted.
     areas: [
-      { name: 'Wide', match: '^wide', cap: 35 },
-      { name: 'VNA 1-5', match: '^vna', cap: 35 },
-      { name: 'Bulk (internal)', match: '^bulk ?int', cap: 14 },
-      { name: 'Bulk external', match: '^bulk ?ext', cap: 8 },
-      { name: 'Mothersons', match: '^m(o)?th', cap: 200, confirm: true },
-      { name: 'Mezzanine', match: '^mezz', cap: 100, confirm: true },
-      { name: 'P&D', match: '^p ?& ?d', cap: 35, confirm: true },
-      { name: 'Kits (Cabs / LP / T4)', match: 'kit$|^t4$', cap: 35, confirm: true },
+      { name: 'Wide', match: '^wide', perPallet: 1, perTrailer: 35 },
+      { name: 'VNA 1-5', match: '^vna', perPallet: 1, perTrailer: 35 },
+      { name: 'Bulk (internal)', match: '^bulk ?int', perPallet: 1, perTrailer: 14 },
+      { name: 'Bulk external', match: '^bulk ?ext', perPallet: 1, perTrailer: 8 },
+      { name: 'Mothersons (boxes)', match: '^m(o)?th', perPallet: 18, perTrailer: 35 },
+      { name: 'Mezzanine (boxes)', match: '^mezz', perPallet: 18, perTrailer: 35 },
+      { name: 'P&D (already in VNA)', match: '^p ?& ?d', perPallet: 1, perTrailer: 35, count: false },
+      { name: 'Kits', match: 'kit$|^t4$', perPallet: 64, perTrailer: 35 },
     ],
-    defaultCap: 35,
-    // Order-level rules, matched against seller order ID / company / comments.
-    // cap: picks per trailer for the whole order. decide: admin sets the fill by hand.
+    defaultPerTrailer: 35, // pallets per trailer for anything not listed
+    // Order-level rules, matched against seller order ID / company / comments / order type.
+    // First match wins. cap: pallets per trailer for the whole order (1 pick = 1 pallet).
+    // perPallet: whole orders per pallet (kits are one small box each).
+    // decide: the admin sets the trailer share by hand.
     rules: [
+      { name: 'Cabs kits', field: 'type', match: 'cabs kit', perPallet: 16 },
+      { name: 'Landpower kits', field: 'type', match: 'landpower.?kit|lp.?kit', perPallet: 16 },
+      { name: 'T4 kits', field: 'type', match: 't4', perPallet: 16 },
       { name: 'Shovels', field: 'seller', match: 'shovel', cap: 16 },
       { name: 'Skips', field: 'seller', match: 'skip', cap: 5 },
       { name: 'Landpower (decide)', field: 'company', match: 'landpower', decide: true },
@@ -48,7 +54,9 @@
     sameDayOnly: true, // only pull orders delivering on the same day as the trailer
     leadMinutes: 60, // stop shopping into a trailer this long before its paperwork time
     protectSources: true, // don't take orders off a trailer that is already full enough
-    includeKitting: false,
+    includeKitting: true,
+    xdockKinds: 'x-dock', // X-Dock department trailers: not ours, but suggested for sharing
+    useXdock: false, // true = plan our orders onto X-Dock trailers like our own
     ourSite: 'emg|maersk', // "Delivery / Collection From" values that are our trailers
     skipKinds: 'transfer|collection|emg to cover', // delivery types that are not our customer trailers
     noShopKinds: 'live tip', // delivery types that keep their own orders but take nothing extra
@@ -132,6 +140,9 @@
     return day * DAY + t;
   }
 
+  // A delivery at 00:00 counts as 23:59 on the day before (the site's convention).
+  const midnight = (abs) => (abs != null && abs % DAY === 0 ? abs - 1 : abs);
+
   // "13 h, 28 min left" / "1 days, 1 h, 28 min left" / "2 h, 5 min late"
   function parseLate(v) {
     const s = lc(v);
@@ -193,7 +204,7 @@
       }
       if (!h) return;
       const id = clean(at(row, h.id));
-      const delivery = parseDateTime(at(row, h.del));
+      const delivery = midnight(parseDateTime(at(row, h.del)));
       if (delivery == null || !/^\d{3,}$/.test(id) || seen.has(id)) return;
       seen.add(id);
 
@@ -283,7 +294,7 @@
         }
         const a = aDay * DAY + anchor;
         const fwd = (t) => (t == null ? null : a + ((t - anchor + DAY) % DAY));
-        paperwork = fwd(p); despatch = fwd(s); delivery = fwd(d);
+        paperwork = fwd(p); despatch = fwd(s); delivery = midnight(fwd(d));
       }
       const statusText = clean(at(row, h.status));
       slots.push({
@@ -302,46 +313,61 @@
   }
 
   /* ----------------------------- sizing ----------------------------- */
-  function areaCap(area, cfg) {
-    for (const a of cfg.areas) if (rx(a.match).test(area)) return Math.max(0.1, +a.cap || cfg.defaultCap);
-    return cfg.defaultCap;
+  function areaRule(area, cfg) {
+    for (const a of cfg.areas) if (rx(a.match).test(area)) return a;
+    return null;
   }
 
-  // Share of one trailer this order needs (1 = a full trailer).
+  // Pallets and share of one trailer this order needs (frac 1 = a full trailer).
   function sizeOrder(o, cfg, override) {
-    const out = { frac: 0, basis: '', rule: null, decide: false, estimated: false };
+    const out = { frac: 0, pallets: 0, basis: '', rule: null, decide: false, estimated: false };
+    const per = cfg.defaultPerTrailer || 35;
     for (const r of cfg.rules) {
-      const field = r.field === 'company' ? o.company : r.field === 'comments' ? o.comments : o.seller;
-      if (!rx(r.match).test(field)) continue;
+      const field = r.field === 'company' ? o.company : r.field === 'comments' ? o.comments : r.field === 'type' ? o.type : o.seller;
+      if (!r.match || !rx(r.match).test(field)) continue;
       out.rule = r.name;
       if (r.decide) out.decide = true;
-      if (+r.cap > 0) {
+      if (+r.perPallet > 0) {
+        out.pallets = 1 / +r.perPallet;
+        out.frac = out.pallets / per;
+        out.basis = `1 order of ${r.perPallet} per pallet (${r.name})`;
+      } else if (+r.cap > 0) {
+        out.pallets = o.total;
         out.frac = o.total / +r.cap;
-        out.basis = `${o.total} picks ÷ ${r.cap} per trailer (${r.name})`;
+        out.basis = `${o.total} pallets ÷ ${r.cap} per trailer (${r.name})`;
       }
       break;
     }
     if (!out.basis) {
-      let frac = 0;
+      let frac = 0, pallets = 0, counted = 0;
       const parts = [];
       for (const [area, n] of Object.entries(o.areas)) {
-        const cap = areaCap(area, cfg);
-        frac += n / cap;
-        parts.push(`${n} ${area}/${cap}`);
+        const a = areaRule(area, cfg);
+        if (a && a.count === false) continue;
+        const pp = a ? Math.max(1, +a.perPallet || 1) : 1;
+        const pt = a ? Math.max(0.1, +a.perTrailer || per) : per;
+        pallets += n / pp;
+        frac += n / pp / pt;
+        counted += n;
+        parts.push(pp > 1 ? `${n} ${area} ÷ ${pp}/pallet` : `${n} ${area}`);
       }
       const picked = Math.max(0, o.total - o.areaSum);
       if (picked > 0) {
-        // Already-picked pallets lose their area in the export: assume the same mix.
-        const perPick = o.areaSum > 0 ? frac / o.areaSum : 1 / cfg.defaultCap;
-        frac += picked * perPick;
+        // Already-picked picks lose their area in the export: assume the same mix.
+        const fPer = counted > 0 ? frac / counted : 1 / per;
+        const pPer = counted > 0 ? pallets / counted : 1;
+        frac += picked * fPer;
+        pallets += picked * pPer;
         parts.push(`${picked} picked`);
-        if (o.areaSum === 0) out.estimated = true;
+        if (counted === 0) out.estimated = true;
       }
       out.frac = frac;
+      out.pallets = pallets;
       out.basis = parts.join(' + ');
     }
     if (override && override.pct != null && override.pct !== '') {
       out.frac = Math.max(0, +override.pct) / 100;
+      out.pallets = out.frac * per;
       out.basis = `set by hand to ${override.pct}%`;
       out.manual = true;
       out.decide = false;
@@ -362,8 +388,12 @@
     const forced = isoToDay(cfg.templateDay);
     if (forced != null && transport.days.some((d) => d.day === forced)) return forced;
     if (transport.days.some((d) => d.day === day)) return day;
-    const sameWd = transport.days.filter((d) => weekday(d.day) === weekday(day));
-    const pool = sameWd.length ? sameWd : transport.days;
+    // The schedule repeats every weekday; Fridays (and weekends) are their own.
+    const wd = weekday(day);
+    const normal = (d) => ['Mon', 'Tue', 'Wed', 'Thu'].includes(weekday(d.day));
+    let pool = transport.days.filter((d) => weekday(d.day) === wd);
+    if (!pool.length && ['Mon', 'Tue', 'Wed', 'Thu'].includes(wd)) pool = transport.days.filter(normal);
+    if (!pool.length) pool = transport.days;
     return pool.length ? pool[pool.length - 1].day : null;
   }
 
@@ -407,6 +437,7 @@
     const skipRx = rx(cfg.skipKinds);
     const noShopRx = cfg.noShopKinds ? rx(cfg.noShopKinds) : /$^/;
     const collRx = rx(cfg.collectionMatch);
+    const xdRx = cfg.xdockKinds ? rx(cfg.xdockKinds) : /$^/;
 
     /* orders */
     const orders = picking.orders
@@ -426,13 +457,18 @@
     const daySet = new Set(orders.map((o) => Math.floor(o.delivery / DAY)));
     daySet.add(Math.floor(now / DAY));
     const { slots: rawSlots, used } = slotsForDays(transport, [...daySet].sort((a, b) => a - b), cfg);
-    const slots = rawSlots
+    const candidates = rawSlots
       .map((s) => ({
         ...s,
         customer: customerOf(s.to, cfg),
         ours: !s.from || siteRx.test(s.from),
+        xdock: xdRx.test(s.kind),
       }))
-      .filter((s) => s.ours && s.customer && s.delivery != null && !skipRx.test(s.kind) && !/external|transfer/i.test(s.loadType))
+      .filter((s) => s.ours && s.customer && s.delivery != null && !skipRx.test(s.kind) && !/external|transfer/i.test(s.loadType));
+    // X-Dock trailers belong to another department: kept aside to suggest sharing.
+    const xdock = candidates.filter((s) => s.xdock && !cfg.useXdock && !s.gone && s.delivery > now);
+    const slots = candidates
+      .filter((s) => cfg.useXdock || !s.xdock)
       .map((s) => ({
         ...s,
         orders: [],
@@ -532,6 +568,7 @@
       s.shopLoad = s.load - s.ownLoad;
       s.picksLeft = s.orders.reduce((t, o) => t + o.remaining, 0);
       s.picks = s.orders.reduce((t, o) => t + o.total, 0);
+      s.pallets = s.orders.reduce((t, o) => t + o.pallets, 0);
       s.trailersNeeded = Math.max(1, Math.ceil(s.load / cfg.maxFill - 1e-9));
       if (s.past) s.verdict = 'past';
       else if (!s.orders.length) s.verdict = 'empty';
@@ -544,15 +581,19 @@
 
     /* 6. exceptions */
     const ex = [];
+    const xdockNear = (customer, abs, hours) => xdock
+      .filter((x) => x.customer === customer && Math.abs(x.delivery - abs) <= hours * 60)
+      .sort((a, b) => Math.abs(a.delivery - abs) - Math.abs(b.delivery - abs));
+    const xdText = (list) => list.length ? ` X-Dock trailer at ${list.slice(0, 2).map((x) => fmtTime(x.delivery)).join(' / ')} – ask X-Dock if it can take it.` : '';
     for (const o of orders) {
       if (o.collection) ex.push({ kind: 'collection', order: o, text: 'Customer collection – not on our trailers' });
       else if (!o.customer) ex.push({ kind: 'customer', order: o, text: `Unknown customer "${o.company}" – add it under Rules › Customers` });
-      else if (!o.slot) ex.push({ kind: 'noslot', order: o, text: `No ${o.customer} trailer in the transport plan for ${fmtDay(o.delivery)}` });
+      else if (!o.slot) ex.push({ kind: 'noslot', order: o, text: `No ${o.customer} trailer in the transport plan for ${fmtDay(o.delivery)}.${xdText(xdockNear(o.customer, o.delivery, 3))}` });
       else if (o.moveType === 'noslot') ex.push({ kind: 'noslot', order: o, text: `${o.note} – planned on ${fmtTime(slotById.get(o.slot).delivery)}` });
       if (o.note && /Missed/.test(o.note)) ex.push({ kind: 'missed', order: o, text: o.note });
       if (o.decide) ex.push({ kind: 'decide', order: o, text: `${o.rule}: set how much of a trailer this takes` });
       if (o.frac > cfg.maxFill + 1e-9) ex.push({ kind: 'big', order: o, text: `Order alone needs ${Math.ceil(o.frac / cfg.maxFill)} trailers` });
-      if (o.estimated) ex.push({ kind: 'estimate', order: o, text: 'Fully picked – area unknown, sized as Wide' });
+      if (o.estimated) ex.push({ kind: 'estimate', order: o, text: 'Fully picked – area unknown, sized as 1 pick = 1 pallet' });
     }
     for (const s of slots) {
       if (s.verdict === 'over') {
@@ -560,13 +601,31 @@
         const hint = spare.length ? ` Unused earlier slot: ${spare.map((x) => fmtTime(x.delivery) + ' ' + x.kind).join(', ')}.` : '';
         ex.push({ kind: 'over', slot: s, text: `Over capacity: ${Math.round(s.load * 100)}% – needs ${s.trailersNeeded} trailers.${hint}` });
       }
+      if ((s.verdict === 'under' || s.verdict === 'low') && !s.past) {
+        const near = xdockNear(s.customer, s.delivery, 2);
+        if (near.length) ex.push({ kind: 'xdock', slot: s, text: `${Math.round(s.load * 100)}% full.${xdText(near)}` });
+      }
       if (s.verdict === 'empty' && s.lostAll) ex.push({ kind: 'free', slot: s, text: 'All orders moved to an earlier trailer – check with transport if this trailer is still needed' });
     }
     const usedAreaCaps = new Set();
     for (const o of orders) for (const a of Object.keys(o.areas)) {
-      const rule = cfg.areas.find((r) => rx(r.match).test(a));
+      const rule = areaRule(a, cfg);
       if (rule && rule.confirm) usedAreaCaps.add(rule.name);
     }
+
+    // Many orders with the same problem (e.g. 40 cabs kits on one wave) become one line.
+    const merged = [];
+    const byKey = new Map();
+    for (const e of ex) {
+      if (!e.order) { merged.push(e); continue; }
+      const key = [e.kind, e.order.customer, e.order.delivery, e.text].join('|');
+      if (byKey.has(key)) { byKey.get(key).orders.push(e.order); continue; }
+      const item = { ...e, orders: [e.order] };
+      byKey.set(key, item);
+      merged.push(item);
+    }
+    ex.length = 0;
+    ex.push(...merged);
 
     const upcoming = slots.filter((s) => !s.past);
     const shopping = moves
@@ -576,7 +635,7 @@
       .sort((a, b) => (a.slot.paperwork || a.slot.delivery) - (b.slot.paperwork || b.slot.delivery));
 
     return {
-      now, cfg, orders, slots, used, moves, shopping, exceptions: ex,
+      now, cfg, orders, slots, xdock, used, moves, shopping, exceptions: ex,
       unconfirmedAreas: [...usedAreaCaps],
       summary: {
         orders: orders.length,
@@ -586,11 +645,30 @@
         moves: shopping.length,
         freed: upcoming.filter((s) => s.lostAll).length,
         empty: upcoming.filter((s) => s.verdict === 'empty').length,
-        noSlot: ex.filter((e) => e.kind === 'noslot').length,
+        noSlot: ex.filter((e) => e.kind === 'noslot').reduce((t, e) => t + e.orders.length, 0),
         decide: ex.filter((e) => e.kind === 'decide').length,
         over: upcoming.filter((s) => s.verdict === 'over').length,
       },
     };
+  }
+
+  // Shopping lines for the same wave going to the same trailer are picked together.
+  function groupShopping(shopping) {
+    const groups = [];
+    const byKey = new Map();
+    for (const m of shopping) {
+      const key = [m.order.wave || m.order.id, m.to, m.type, m.order.delivery].join('|');
+      if (byKey.has(key)) {
+        const g = byKey.get(key);
+        g.orders.push(m.order);
+        g.frac += m.order.frac; g.pallets += m.order.pallets; g.remaining += m.order.remaining; g.total += m.order.total;
+        continue;
+      }
+      const g = { ...m, orders: [m.order], frac: m.order.frac, pallets: m.order.pallets, remaining: m.order.remaining, total: m.order.total };
+      byKey.set(key, g);
+      groups.push(g);
+    }
+    return groups;
   }
 
   /* ---------------------------- formatting -------------------------- */
@@ -622,7 +700,7 @@
   }
 
   return {
-    DAY, DEFAULT_CONFIG, parsePicking, parseTransport, plan, sizeOrder, customerOf, detect,
+    DAY, DEFAULT_CONFIG, parsePicking, parseTransport, plan, sizeOrder, customerOf, detect, groupShopping,
     fmtTime, fmtDay, fmtDayTime, absToLocalInput, localInputToAbs, dayToISO, isoToDay, weekday,
     _internal: { parseDay, parseTime, parseDateTime, parseLate, chooseTemplateDay },
   };

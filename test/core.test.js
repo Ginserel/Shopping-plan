@@ -11,7 +11,7 @@ const bySeller = (p, ref) => p.orders.find((o) => o.seller === ref);
 const slotOf = (p, o) => p.slots.find((s) => s.id === o.slot);
 
 test('reads the picking status export', () => {
-  assert.strictEqual(picking.orders.length, 23);
+  assert.strictEqual(picking.orders.length, 37);
   assert.strictEqual(SP.fmtDayTime(picking.asOf), 'Mon 23/11 16:30');
   const o = picking.orders.find((x) => x.seller === 'CP PNT 241126');
   assert.strictEqual(o.wave, '220122');
@@ -24,8 +24,8 @@ test('reads the transport plan and puts late-evening rows on the night before', 
   const lp = transport.slots.find((s) => s.day === SP.isoToDay('2026-11-24') && s.to === 'Landpower' && /live tip/i.test(s.kind));
   assert.strictEqual(SP.fmtDayTime(lp.paperwork), 'Mon 23/11 23:00');
   assert.strictEqual(SP.fmtDayTime(lp.delivery), 'Tue 24/11 01:00');
-  const cabs = transport.slots.find((s) => s.day === SP.isoToDay('2026-11-24') && s.to === 'Cabs');
-  assert.strictEqual(SP.fmtDayTime(cabs.delivery), 'Wed 25/11 00:00');
+  const cabs = transport.slots.find((s) => s.day === SP.isoToDay('2026-11-24') && s.to === 'Cabs' && s.kind === 'OTM');
+  assert.strictEqual(SP.fmtDayTime(cabs.delivery), 'Tue 24/11 23:59'); // 00:00 counts as 23:59 the day before
 });
 
 test('sizes orders by area, with shovel and skip rules', () => {
@@ -80,4 +80,49 @@ test('collections stay off our trailers', () => {
 test('uses the same weekday as a template when the date is missing', () => {
   const p = run({ templateDay: null }, { now: SP.localInputToAbs('2026-11-30T16:30') });
   assert.ok(p.used.some((u) => SP.dayToISO(u.day) === '2026-11-30' && !u.exact && SP.dayToISO(u.source) === '2026-11-23'));
+});
+
+test('boxes: Mothersons and Mezzanine are 18 picks per pallet', () => {
+  const p = run();
+  const o = bySeller(p, 'LDL-QA-241126-SEE NOTES'); // 4 Mothersons boxes
+  assert.ok(Math.abs(o.pallets - 4 / 18) < 1e-9);
+});
+
+test('P&D picks are not counted twice', () => {
+  const o = bySeller(run(), 'PS-241126-7AM'); // 12 picks in Wide/VNA + 2 in P&D
+  assert.strictEqual(o.pallets, 12);
+});
+
+test('kits: 16 orders to a pallet, and kit lines group by wave', () => {
+  const p = run();
+  const kits = p.orders.filter((o) => o.rule === 'Cabs kits');
+  assert.strictEqual(kits.length, 12);
+  assert.ok(Math.abs(kits[0].pallets - 1 / 16) < 1e-9);
+  const lines = SP.groupShopping(p.shopping).filter((g) => g.order.rule === 'Cabs kits');
+  assert.strictEqual(lines.length, 1);
+  assert.strictEqual(lines[0].orders.length, 12);
+  assert.strictEqual(bySeller(p, 'F-DEC160009-02-1810').rule, 'Landpower kits');
+});
+
+test('X-Dock trailers are not ours, but are suggested for sharing', () => {
+  const p = run();
+  assert.ok(!p.slots.some((s) => /x-dock/i.test(s.kind)));
+  assert.ok(p.exceptions.some((e) => e.kind === 'xdock' && e.slot.customer === 'Heavy'));
+  const shared = run({ useXdock: true });
+  assert.ok(shared.slots.some((s) => /x-dock/i.test(s.kind)));
+});
+
+test('Friday only uses a Friday; other days use any Mon-Thu', () => {
+  const pick = SP._internal.chooseTemplateDay;
+  const t = { days: [{ day: SP.isoToDay('2026-11-23') }, { day: SP.isoToDay('2026-11-24') }, { day: SP.isoToDay('2026-11-20') }] };
+  assert.strictEqual(SP.dayToISO(pick(t, SP.isoToDay('2026-11-26'), {})), '2026-11-24'); // Thu <- latest Mon-Thu
+  assert.strictEqual(SP.dayToISO(pick(t, SP.isoToDay('2026-11-27'), {})), '2026-11-20'); // Fri <- Fri
+});
+
+test('an order due at 00:00 counts as 23:59 the day before', () => {
+  const rows = S.picking();
+  const h = rows.findIndex((r) => r[0] === 'Delivery Date');
+  rows[h + 1][0] = '25/11/2026 00:00';
+  const o = SP.parsePicking(rows).orders[0];
+  assert.strictEqual(SP.fmtDayTime(o.delivery), 'Tue 24/11 23:59');
 });

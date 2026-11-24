@@ -24,7 +24,7 @@
     ['06:00', '0000501102', '0000220102', 'BHL-PRIO-BAY12-231126', 'Backhoe Loaders', 'Allocated', 'Not Released', '', 9, 9, { Wide: 6, VNA4: 3 }],
     ['06:00', '0000501103', '0000220103', 'LDL-ENG-241126-01', 'Loadall', 'Allocated', 'Not Released', '', 5, 5, { Wide: 3, 'Mthr sons': 2 }],
     ['06:00', '0000501104', '0000220104', 'LDL-QA-241126-SEE NOTES', 'Loadall', 'Allocated', 'Not Released', 'Label parts NOT FOR PRODUCTION', 4, 4, { 'Mthr sons': 4 }],
-    ['07:00', '0000501105', '0000220105', 'PS-241126-7AM', 'Power Systems', 'Allocated', 'Not Released', '', 12, 12, { Wide: 6, VNA2: 3, VNA5: 3 }],
+    ['07:00', '0000501105', '0000220105', 'PS-241126-7AM', 'Power Systems', 'Allocated', 'Not Released', '', 12, 12, { Wide: 6, VNA2: 3, VNA5: 3, 'P&D': 2 }],
     ['07:00', '0000501106', '0000220106', 'HP-241126-01', 'Heavy Products', 'Allocated', 'Not Released', '', 14, 14, { Wide: 1, 'Mthr sons': 10, VNA2: 1, BULKINT: 2 }],
     ['07:30', '0000501107', '0000220107', 'CP SO 241126-1', 'Compact Products', 'In Progress', 'Released', '', 2, 1, { 'Mthr sons': 1 }],
     ['07:30', '0000501108', '0000220108', 'CP SO 241126-3', 'Compact Products', 'Allocated', 'Released', '', 2, 2, { VNA4: 2 }],
@@ -45,6 +45,12 @@
     ['18:00', '0000501123', '0000220123', 'CP SO 241126-2', 'Compact Products', 'Allocated', 'Not Released', '', 1, 1, { VNA4: 1 }],
   ];
 
+  // Kitting: [time, orderId, wave, seller ref, order type, company, picks, area]
+  const KITS = [];
+  for (let i = 0; i < 12; i++) KITS.push(['20:00', String(501200 + i).padStart(10, '0'), '0000220200', `C-1545${String(300 + i)}-26-11-24`, '2 - Cabs Kit', 'Cabs Uttoxeter', 3 + (i % 2), 'CABSKIT']);
+  KITS.push(['18:00', '0000501220', '0000220220', 'F-DEC160009-02-1810', '8 - LandPower-KIT', 'Landpower Returns', 4, 'LPKIT']);
+  KITS.push(['18:00', '0000501221', '0000220220', 'F-DEC160008-04-1810', '8 - LandPower-KIT', 'Landpower Returns', 4, 'LPKIT']);
+
   function picking() {
     const head = ['Delivery Date', 'Order ID', 'Wave ID', null, 'Seller Order ID', null, 'Order Type', 'Company', null, 'Status', 'Task Release', 'Comments', 'LATE', 'Total Picks', 'Rmn. Picks', 'Picked%', ...AREAS];
     const rows = [
@@ -61,6 +67,12 @@
       tot += total; rem += remaining;
     }
     rows.push([null, 'Total Orders:', ORDERS.length, null, null, null, null, null, null, null, null, null, null, tot, rem]);
+    rows.push(['Kitting Orders'], ['DelDate: 24/11/2026'], head);
+    for (const [tm, id, wave, seller, type, company, picks, area] of KITS) {
+      const [hh, mm] = tm.split(':').map(Number);
+      rows.push([`24/11/2026 ${tm}`, id, wave, null, seller, null, type, company, null, 'Allocated', 'Released', '', late(24, hh, mm), picks, picks, '0 %', ...AREAS.map((a) => (a === area ? picks : null))]);
+    }
+    rows.push([null, 'Total Orders:', KITS.length]);
     return rows;
   }
 
@@ -74,6 +86,7 @@
     ['05:00', '06:20', '07:00', 'Power Systems', 'OTM', ''],
     ['05:30', '06:15', '07:30', 'Compact', 'MH SO Orders', ''],
     ['06:00', '06:40', '08:00', 'Rayne', 'OTM', ''],
+    ['07:00', '08:10', '09:00', 'Heavy', 'X-Dock', ''],
     ['08:00', '09:20', '10:00', 'Power Systems', 'Raw Blocks & Heads', ''],
     ['09:00', '09:45', '11:00', 'Earthmovers', 'TIGER', ''],
     ['09:00', '10:00', '11:00', 'Loadall', 'Kingspan', ''],
@@ -87,6 +100,7 @@
     ['16:00', '16:45', '18:00', 'Landpower', 'ACO & Kits', ''],
     ['16:00', '16:45', '18:00', 'Compact', 'MH SO Orders', ''],
     ['16:00', '17:00', '18:00', 'Loadall', 'ACO', ''],
+    ['16:00', '17:10', '18:00', 'Cabs', 'ACO + Kits', ''],
     ['20:00', '21:10', '22:00', 'ATL Site', 'Transfers', ''],
     ['22:00', '23:10', '00:00', 'Cabs', 'OTM', ''],
   ];

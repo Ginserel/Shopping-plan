@@ -61,14 +61,15 @@ const pct = (x) => `${Math.round(x * 100)}%`.padStart(5);
 console.log(`Plan as of ${SP.fmtDayTime(p.now)}`);
 p.used.forEach((u) => console.log(`  Trailers for ${SP.fmtDay(u.day * SP.DAY)} from transport day ${SP.fmtDay(u.source * SP.DAY)}${u.exact ? '' : ' (template)'}`));
 console.log('\nSHOPPING LIST');
-for (const m of p.shopping) {
-  const o = m.order;
-  console.log(`  by ${SP.fmtDayTime(m.slot.paperwork)}  ${o.customer.padEnd(13)} ${SP.fmtTime(m.slot.delivery)} ${m.slot.kind.padEnd(16)} <- ${o.id} wave ${o.wave} ${o.seller.padEnd(28)} due ${SP.fmtTime(o.delivery)} ${pct(o.frac)}  [${m.type}] ${o.remaining}/${o.total} picks left`);
+for (const g of SP.groupShopping(p.shopping)) {
+  const o = g.order;
+  const what = g.orders.length > 1 ? `${g.orders.length} orders on wave ${o.wave}`.padEnd(46) : `${o.id} wave ${o.wave} ${o.seller.padEnd(28)}`;
+  console.log(`  by ${SP.fmtDayTime(g.slot.paperwork)}  ${o.customer.padEnd(13)} ${SP.fmtTime(g.slot.delivery)} ${g.slot.kind.padEnd(16)} <- ${what} due ${SP.fmtTime(o.delivery)} ${pct(g.frac)} ${g.pallets.toFixed(1).padStart(5)} pal [${g.type}] ${g.remaining}/${g.total} picks left`);
 }
 console.log('\nTRAILERS');
 for (const s of p.slots.filter((x) => !x.past)) {
   console.log(`  ${SP.fmtDayTime(s.delivery)} ${s.customer.padEnd(13)} ${s.kind.padEnd(22)} ${pct(s.load)} ${s.verdict.padEnd(6)} ${s.orders.map((o) => o.seller || o.id).join(', ')}`);
 }
 console.log('\nEXCEPTIONS');
-for (const e of p.exceptions) console.log(`  [${e.kind}] ${e.order ? e.order.id + ' ' + e.order.seller : SP.fmtDayTime(e.slot.delivery) + ' ' + e.slot.customer}: ${e.text}`);
+for (const e of p.exceptions) console.log(`  [${e.kind}] ${e.order ? (e.orders.length > 1 ? `${e.orders.length} orders (wave ${e.order.wave})` : e.order.id + ' ' + e.order.seller) : SP.fmtDayTime(e.slot.delivery) + ' ' + e.slot.customer}: ${e.text}`);
 console.log('\nSUMMARY', p.summary);

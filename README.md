@@ -23,17 +23,19 @@ Nothing is uploaded anywhere. Files are read in the browser.
 
 ## How it decides
 
-**Trailer share of an order.** For each area: remaining picks ÷ picks that fill a trailer. Picks already done are assumed to have the same area mix.
+**Pallets and trailer share of an order.** 1 pick = 1 pallet, except box areas. For each area: pallets ÷ pallets that fill a trailer. Picks already done are assumed to have the same area mix.
 
-| Area | Picks per trailer |
-| --- | --- |
-| Wide, VNA 1-5 | 35 |
-| Bulk internal | 14 |
-| Bulk external | 8 (range 5–12) |
-| Shovels (seller ref contains "shovel") | 16 |
-| Skips (seller ref contains "skip") | 5 |
-| Landpower | estimated, flagged for the admin to set |
-| Mothersons, Mezzanine, P&D, kits | **guesses – confirm in Rules** |
+| Area / order | Picks per pallet | Pallets per trailer |
+| --- | --- | --- |
+| Wide, VNA 1-5 | 1 | 35 |
+| Bulk internal | 1 | 14 |
+| Bulk external | 1 | 8 (range 5–12) |
+| Mothersons, Mezzanine (boxes) | 18 (16–20) | 35 |
+| P&D | not counted – already in VNA | |
+| Shovels (seller ref contains "shovel") | 1 | 16 |
+| Skips (seller ref contains "skip") | 1 | 5 |
+| Cabs, Landpower and T4 kits | 16 orders per pallet (1 small box each) | 35 |
+| Landpower | estimated, flagged for the admin to set | |
 
 **Home trailer.** An order goes on the trailer whose wave number is written in the transport plan's "TRL / Load Check" column. Otherwise it goes on the trailer for the same customer and delivery time. If there is no trailer at that time, it goes on the latest trailer before it.
 
@@ -45,7 +47,13 @@ Nothing is uploaded anywhere. Files are read in the browser.
 
 A trailer whose orders have all moved is flagged **Maybe not needed**. It is never refilled.
 
-**Transport plan days.** If the plan has no sheet for the date, the same weekday in the file is used as a template. Waves and loading status are ignored in that case.
+**Transport plan days.** The schedule repeats every day except Friday. If the plan has no sheet for the date, the same weekday in the file is used. Otherwise any Mon–Thu sheet is used, but a Friday only ever uses a Friday. Waves and loading status are ignored for a borrowed day.
+
+**Midnight.** A delivery at 00:00 counts as 23:59 on the day before.
+
+**X-Dock.** X-Dock trailers belong to the X-Dock department, so orders aren't planned onto them. When one of our trailers stays under target, or an order has no trailer, and an X-Dock trailer goes to the same customer around that time, it's listed under **Could share with X-Dock**. A Rules switch plans onto X-Dock trailers like our own.
+
+**Grouping.** Orders on the same wave that go to the same trailer are one line (e.g. 38 Cabs kits).
 
 ## Command line (for automation)
 
